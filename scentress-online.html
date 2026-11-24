@@ -10,6 +10,11 @@
   -webkit-user-select: none;
   user-select: none;
 }
+.header-actions { display: flex; gap: 6px; white-space: nowrap; }
+@media (max-width: 600px) {
+  header h1 { font-size: 16px; }
+  .header-actions button { min-height: 38px; font-size: 13px; }
+}
 .room-code {
   flex: 1 1 12em;
   min-width: 0;
@@ -105,7 +110,7 @@ body.game-rotated #roomCode { flex-basis: 8em; }
 }
 </style>
 <main>
-<header><h1>센트리스 <span>· 온라인 테스트</span></h1><button id="full" type="button">전체화면</button></header>
+<header><h1>센트리스 <span>· 온라인 테스트</span></h1><div class="header-actions"><button id="leaveMatch" type="button" hidden>나가기</button><button id="full" type="button">전체화면</button></div></header>
 <section class="stage setup-open" id="stage" aria-label="스핑크스 경기장">
   <canvas id="field" width="1170" height="540" tabindex="-1"></canvas>
   <div class="hud" id="hud" hidden>
@@ -560,7 +565,7 @@ class Arena {
 
 
 const frameFields = ['active', 'turn', 'phase', 'remaining', 'charge', 'charging',
-  'wind', 'pillar', 'shot', 'blast', 'notice', 'pause', 'result', 'reconnectUsed', 'reconnectHandled'];
+  'wind', 'pillar', 'shot', 'blast', 'notice', 'pause', 'result', 'reconnectUsed', 'reconnectHandled', 'resigned'];
 
 function packArena(arena) {
   const frame = Object.fromEntries(frameFields.map(key => [key, arena[key] ?? null]));
@@ -675,20 +680,35 @@ function startArena(arena) {
   get('ending').hidden = true;
   get('controls').hidden = false;
   get('hud').hidden = false;
+  get('leaveMatch').hidden = false;
+  get('leaveMatch').disabled = false;
   field.focus();
 }
 get('start').onclick = () => startArena(new Arena([selected('left'), selected('right')], Math.random,
   previousFirst === undefined ? undefined : 1 - previousFirst));
 
-get('replay').onclick = () => {
+function showSetupScreen() {
   game = undefined;
   keys.clear();
   draw.clearRect(0, 0, field.width, field.height);
   get('hud').hidden = true;
   get('ending').hidden = true;
   get('controls').hidden = true;
+  get('leaveMatch').hidden = true;
+  get('connectionOverlay').hidden = true;
   get('stage').classList.add('setup-open');
   get('setup').hidden = false;
+}
+get('replay').onclick = showSetupScreen;
+get('leaveMatch').onclick = () => {
+  if (!game || game.result) return;
+  if (typeof onlineMode === 'function' && onlineMode()) {
+    void resignFromMatch();
+  } else {
+    music.pause();
+    get('music').textContent = '음악 켜기';
+    showSetupScreen();
+  }
 };
 
 function nextTrack() {
@@ -999,10 +1019,14 @@ function showMatchResult() {
   const winner = game.result === 'left' ? '1' : '2';
   get('winner').textContent = game.result === 'void' ? '경기 무효'
     : game.result === 'draw' ? '무승부' : '플레이어 ' + winner + ' 승리';
-  get('summary').textContent = game.players.map(player => player.character.name + ' ' + player.hp + '/' + player.maxHp + ' HP').join(' · ');
+  const score = game.players.map(player => player.character.name + ' ' + player.hp + '/' + player.maxHp + ' HP').join(' · ');
+  get('summary').textContent = game.resigned === 'host' || game.resigned === 'guest'
+    ? '플레이어 ' + (game.resigned === 'host' ? '1' : '2') + ' 기권 · ' + score
+    : score;
   get('connectionOverlay').hidden = true;
   get('ending').hidden = false;
   get('controls').hidden = true;
+  get('leaveMatch').hidden = true;
 }
 requestAnimationFrame(frame);
 
@@ -1091,13 +1115,14 @@ function openRoom(service, code, side) {
   const path = 'testRooms/' + code + '/';
   const pathRef = name => service.ref(service.database, path + name);
   room = {
-    code, side, service, input: pathRef('input'), frame: pathRef('frame'),
+    code, side, service, input: pathRef('input'), frame: pathRef('frame'), resignation: pathRef('resignation'),
     subscriptions: [], presence: null, connected: false, paused: true, timeOffset: 0,
   };
   return pathRef;
 }
 
 function onlineCanAdvance(now) {
+  if (room.resigning) return false;
   const participants = room.presence ?? {};
   const decision = room.connected
     ? reconnectState([participants.host, participants.guest], Date.now() + room.timeOffset,
@@ -1147,6 +1172,11 @@ function watchConnection(path) {
   const { service } = session;
   const refInfo = name => service.ref(service.database, '.info/' + name);
   const own = path('presence/' + (session.side === 0 ? 'host' : 'guest'));
+  session.subscriptions.push(service.onValue(session.resignation, snapshot => {
+    if (!snapshot.exists()) return;
+    session.resigned = snapshot.val().side;
+    if (game) applyResignation(session);
+  }, networkError));
   session.subscriptions.push(service.onValue(refInfo('serverTimeOffset'), snapshot => {
     session.timeOffset = snapshot.val() ?? 0;
   }));
@@ -1230,10 +1260,47 @@ function applyFrame(frame) {
   const previousTurn = game.turn;
   const wasResult = game.result;
   restoreArena(game, frame);
+  if (room.resigned && !game.result) applyResignation(room);
   if (game.turn !== previousTurn || game.phase === 'flight' || game.phase === 'blast') follow = true;
   if (game.result && !wasResult) {
     render();
     showMatchResult();
+  }
+}
+
+function applyResignation(session) {
+  if (!game || game.result || session.resigning) return;
+  game.resigned = session.resigned;
+  game.result = session.resigned === 'host' ? 'right' : 'left';
+  game.phase = 'result';
+  if (session.side === 0) publishOnlineFrame(performance.now());
+  render();
+  showMatchResult();
+}
+
+async function resignFromMatch() {
+  const session = room;
+  if (!session || session.resigning || game.result) return;
+  if (!session.connected) {
+    get('connectionOverlay').hidden = false;
+    get('connectionStatus').textContent = '연결이 복구되면 나갈 수 있어요.';
+    return;
+  }
+  session.resigning = true;
+  session.paused = true;
+  get('leaveMatch').disabled = true;
+  try {
+    const { service, side } = session;
+    await service.set(session.resignation, { side: side === 0 ? 'host' : 'guest', uid: service.uid });
+    music.pause();
+    get('music').textContent = '음악 켜기';
+    showSetupScreen();
+    returnToSetup(session);
+  } catch {
+    session.resigning = false;
+    get('leaveMatch').disabled = false;
+    if (session.resigned) applyResignation(session);
+    else networkError(Error('Could not record resignation'));
   }
 }
 
