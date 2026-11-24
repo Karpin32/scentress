@@ -240,14 +240,17 @@ class Arena {
     this.craters = [];
     const positions = [];
     for (let x = BODY / 2; x <= WIDTH - BODY / 2; x += CELL) {
-      positions.push({ x, y: Math.round(initialHeight(x) / CELL) * CELL });
+      const y = this.surface(x, HEIGHT, CELL);
+      if (y === null) continue;
+      const { slope, supported } = this.support({ slope: 0 }, x, y);
+      if (supported) positions.push({ x, y, slope });
     }
     this.players = selection.map((id, index) => {
       const character = characters[id];
       return {
         ...positions[Math.floor(random() * positions.length)], character,
         hp: character.hp, maxHp: character.hp, angle: (character.minimumAngle + character.maximumAngle) / 2,
-        facing: index === 0 ? 1 : -1, slope: 0, missedTurns: 0, previousPower: null,
+        facing: index === 0 ? 1 : -1, missedTurns: 0, previousPower: null,
       };
     });
     this.wind = random() * 200 - 100;
@@ -283,7 +286,7 @@ class Arena {
   support(player, x, y) {
     const reach = BODY / 2;
     const left = this.surface(x - reach, y + 40, y - 40);
-    const right = this.surface(x + reach, y + 40, y - 40);
+    const right = this.surface(Math.min(WIDTH - 0.1, x + reach), y + 40, y - 40);
     const slope = left === null || right === null ? player.slope : Math.atan2(right - left, BODY);
     let supported = 0;
     for (let offset = -22.5; offset <= 22.5; offset += 5) {
