@@ -21,6 +21,8 @@
   font: inherit;
 }
 .room-list select { min-width: 0; max-width: 100%; }
+.room-status { color: #ffdc9c; font-weight: 650; overflow-wrap: anywhere; }
+.room-status:empty { display: none; }
 body.game-rotated { overflow: hidden; }
 body.game-rotated main {
   padding: 8px;
@@ -118,6 +120,7 @@ body.game-rotated #roomCode { flex-basis: 8em; }
       <h2>스핑크스 · 2인 온라인 테스트</h2>
       <div class="choices"><label>플레이어 1<select id="left"></select></label><label>플레이어 2<select id="right"></select></label></div>
             <button class="primary" id="start">로컬 대전 시작</button>
+      <small id="roomStatus" class="room-status" role="status"></small>
       <div class="actions"><button id="makeRoom">온라인 방 만들기 (P1)</button><button id="joinRoom">방 참가 (P2)</button></div>
       <div class="actions">
         <input class="room-code" id="roomCode" aria-label="방 코드" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="24" placeholder="방 코드">
@@ -131,7 +134,6 @@ body.game-rotated #roomCode { flex-basis: 8em; }
         <select id="roomList" aria-label="대기 중인 방"><option value="">대기 중인 방 선택</option></select>
         <button id="loadRooms">방 목록 새로고침</button>
       </div>
-      <small id="roomStatus" role="status"></small>
     </div>
   </div>
   <div class="overlay" id="ending" hidden>
@@ -1057,7 +1059,10 @@ async function createRoom() {
   await service.update(service.ref(service.database), entries);
   get('roomPin').value = '';
   get('roomCode').value = code;
-  get('roomStatus').textContent = '방 코드를 상대에게 보내고 참가를 기다려 주세요.';
+  get('makeRoom').textContent = '방 만들기 완료';
+  get('roomStatus').textContent = privateRoom
+    ? '비공개방을 만들었어요. 상대가 방 목록에서 선택하고 비밀번호를 입력하면 시작돼요.'
+    : '공개방을 만들었어요. 상대가 방 목록에서 참가하면 시작돼요.';
   room.subscriptions.push(service.onValue(path('guest'), snapshot => {
     const guest = snapshot.val();
     if (!guest || game) return;
@@ -1125,6 +1130,7 @@ function runRoomAction(action) {
   return async () => {
     if (room) return;
     for (const id of ['makeRoom', 'joinRoom', 'start']) get(id).disabled = true;
+    get('roomStatus').textContent = action === createRoom ? '방을 만드는 중…' : '방에 참가하는 중…';
     try { await action(); }
     catch (error) {
       room?.subscriptions.forEach(unsubscribe => unsubscribe());
@@ -1184,6 +1190,7 @@ get('replay').addEventListener('click', () => {
   room.subscriptions.forEach(unsubscribe => unsubscribe());
   room = undefined;
   remoteKeys = new Set();
+  get('makeRoom').textContent = '온라인 방 만들기 (P1)';
   for (const id of ['makeRoom', 'joinRoom', 'start']) get(id).disabled = false;
   get('roomCode').value = '';
   get('roomPin').value = '';
