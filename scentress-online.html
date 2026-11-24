@@ -22,6 +22,7 @@
 }
 body.game-rotated { overflow: hidden; }
 body.game-rotated main {
+  padding: 8px;
   position: fixed;
   top: 0;
   left: 100%;
@@ -36,10 +37,12 @@ body.game-rotated main {
 body.game-rotated main header { margin-bottom: 6px; }
 body.game-rotated .stage:not(.setup-open) {
   min-height: 0;
-  max-width: calc((100dvw - 115px) * 19.5 / 9);
+  max-width: calc(max(95px, 100dvw - 122px) * 19.5 / 9);
   margin-inline: auto;
 }
 body.game-rotated footer { display: none; }
+body.game-rotated .controls { margin-top: 6px; gap: 6px; }
+body.game-rotated .controls button { min-height: 42px; padding: 4px 12px; }
 body.game-rotated .stage.setup-open { aspect-ratio: auto; min-height: 0; }
 body.game-rotated .stage.setup-open canvas { display: none; }
 body.game-rotated .stage.setup-open #setup { position: relative; overflow: visible; padding: 6px; }
@@ -60,6 +63,14 @@ body.game-rotated #roomCode { flex-basis: 8em; }
 @media (orientation: landscape) and (max-height: 500px) {
   main { padding: 8px; }
   header { margin-bottom: 6px; }
+  .stage:not(.setup-open) {
+    min-height: 0;
+    max-width: calc(max(95px, 100dvh - 122px) * 19.5 / 9);
+    margin-inline: auto;
+  }
+  .controls { margin-top: 6px; gap: 6px; }
+  .controls button { min-height: 42px; padding: 4px 12px; }
+  footer { display: none; }
   .stage.setup-open { aspect-ratio: auto; min-height: 0; }
   .stage.setup-open canvas { display: none; }
   .stage.setup-open #setup { position: relative; overflow: visible; padding: 6px; }
