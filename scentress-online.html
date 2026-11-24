@@ -20,6 +20,7 @@
   background: #180e22;
   font: inherit;
 }
+.room-list select { min-width: 0; max-width: 100%; }
 body.game-rotated { overflow: hidden; }
 body.game-rotated main {
   padding: 8px;
@@ -121,6 +122,14 @@ body.game-rotated #roomCode { flex-basis: 8em; }
       <div class="actions">
         <input class="room-code" id="roomCode" aria-label="방 코드" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="24" placeholder="방 코드">
         <button id="copyRoom">코드 복사</button>
+      </div>
+      <div class="actions room-options">
+        <select id="visibility" aria-label="방 공개 설정"><option value="public">공개방</option><option value="private">비공개방</option></select>
+        <input class="room-code" id="roomPin" type="password" inputmode="numeric" maxlength="4" autocomplete="off" aria-label="비밀번호 4자리" placeholder="비밀번호 4자리" hidden>
+      </div>
+      <div class="actions room-list">
+        <select id="roomList" aria-label="대기 중인 방"><option value="">대기 중인 방 선택</option></select>
+        <button id="loadRooms">방 목록 새로고침</button>
       </div>
       <small id="roomStatus" role="status"></small>
     </div>
@@ -561,6 +570,14 @@ function restoreArena(arena, frame) {
   for (const crater of craters.slice(arena.craters.length)) arena.carve(...crater);
 }
 
+function isRoomPin(value) {
+  return typeof value === 'string' && /^[0-9]{4}$/.test(value);
+}
+
+function roomLabel(room) {
+  return room.private ? '🔒 ' + room.title : room.title;
+}
+
 const get = id => document.getElementById(id);
 const field = get('field');
 const draw = field.getContext('2d');
@@ -946,6 +963,8 @@ let remoteKeys = new Set();
 let lastFrame = 0;
 let inputSequence = 0;
 let writePending = false;
+let listedRooms = new Map();
+let unsubscribeLobby;
 const sdk = 'https://www.gstatic.com/firebasejs/11.10.0/';
 
 function connect() {
@@ -1017,17 +1036,32 @@ function openRoom(service, code, side) {
 }
 
 async function createRoom() {
+  const privateRoom = get('visibility').value === 'private';
+  const pin = get('roomPin').value;
+  if (privateRoom && !isRoomPin(pin)) {
+    get('roomStatus').textContent = '비공개방 비밀번호는 숫자 4자리로 입력해 주세요.';
+    get('roomPin').focus();
+    return;
+  }
   const service = await connect();
   const code = Array.from(crypto.getRandomValues(new Uint8Array(12)),
     value => value.toString(16).padStart(2, '0')).join('');
   const path = openRoom(service, code, 0);
   const character = selected('left');
-  await service.set(path('host'), { uid: service.uid, character, expires: Date.now() + 7200000 });
+  const expires = Date.now() + 7200000;
+  const entries = {
+    ['testRooms/' + code + '/host']: { uid: service.uid, character, expires, private: privateRoom },
+    ['lobbyRooms/' + code]: { title: '스핑크스 대전 · ' + characters[character].name, private: privateRoom, expires, owner: service.uid },
+  };
+  if (privateRoom) entries['testRooms/' + code + '/pin'] = pin;
+  await service.update(service.ref(service.database), entries);
+  get('roomPin').value = '';
   get('roomCode').value = code;
   get('roomStatus').textContent = '방 코드를 상대에게 보내고 참가를 기다려 주세요.';
   room.subscriptions.push(service.onValue(path('guest'), snapshot => {
     const guest = snapshot.val();
     if (!guest || game) return;
+    service.remove(service.ref(service.database, 'lobbyRooms/' + code)).catch(networkError);
     startArena(new Arena([character, guest.character]));
     publishOnlineFrame(performance.now() + 100);
   }, networkError));
@@ -1053,9 +1087,21 @@ async function joinRoom() {
     get('roomStatus').textContent = '받은 방 코드 24자를 입력해 주세요.';
     return;
   }
+  const pin = get('roomPin').value;
+  const roomInfo = listedRooms.get(code);
+  if ((roomInfo?.private || pin !== '') && !isRoomPin(pin)) {
+    get('roomStatus').textContent = '비밀번호는 숫자 4자리로 입력해 주세요.';
+    get('roomPin').hidden = false;
+    get('roomPin').focus();
+    return;
+  }
   const service = await connect();
   const path = openRoom(service, code, 1);
+  if (isRoomPin(pin)) {
+    await service.set(path('attempt'), { uid: service.uid, pin, at: service.serverTimestamp() });
+  }
   await service.set(path('guest'), { uid: service.uid, character: selected('right') });
+  get('roomPin').value = '';
   get('roomStatus').textContent = '방장과 연결하는 중…';
   room.subscriptions.push(service.onValue(room.frame, snapshot => {
     if (!snapshot.exists()) return;
@@ -1084,12 +1130,49 @@ function runRoomAction(action) {
       room?.subscriptions.forEach(unsubscribe => unsubscribe());
       room = undefined;
       networkError(error);
+      if (action === joinRoom && /permission.denied/i.test(String(error))) {
+        get('roomStatus').textContent = '입장할 수 없어요. 비밀번호나 방 상태를 확인하고 3초 뒤 다시 시도해 주세요.';
+      }
     }
     if (!room) for (const id of ['makeRoom', 'joinRoom', 'start']) get(id).disabled = false;
   };
 }
 get('makeRoom').onclick = runRoomAction(createRoom);
 get('joinRoom').onclick = runRoomAction(joinRoom);
+function showPinField() {
+  const info = listedRooms.get(get('roomCode').value.trim().toLowerCase());
+  get('roomPin').hidden = get('visibility').value !== 'private' && !info?.private;
+}
+get('visibility').onchange = showPinField;
+get('roomCode').oninput = showPinField;
+get('roomList').onchange = () => {
+  const selectedRoom = get('roomList').value;
+  if (!selectedRoom) return;
+  get('roomCode').value = selectedRoom;
+  get('roomPin').value = '';
+  showPinField();
+};
+get('loadRooms').onclick = async () => {
+  try {
+    const service = await connect();
+    unsubscribeLobby?.();
+    const listQuery = service.query(service.ref(service.database, 'lobbyRooms'),
+      service.orderByChild('expires'), service.startAt(Date.now()), service.limitToLast(25));
+    unsubscribeLobby = service.onValue(listQuery, snapshot => {
+      const selection = get('roomList').value;
+      listedRooms = new Map();
+      snapshot.forEach(item => {
+        if (item.val().expires > Date.now() && item.val().owner !== service.uid) listedRooms.set(item.key, item.val());
+      });
+      const list = get('roomList');
+      list.replaceChildren(new Option(listedRooms.size ? '대기 중인 방 선택' : '대기 중인 방 없음', ''));
+      for (const [code, details] of listedRooms) list.add(new Option(roomLabel(details), code));
+      if (listedRooms.has(selection)) list.value = selection;
+    }, networkError);
+  } catch (error) {
+    networkError(error);
+  }
+};
 get('copyRoom').onclick = async () => {
   const input = get('roomCode');
   input.select();
@@ -1103,6 +1186,8 @@ get('replay').addEventListener('click', () => {
   remoteKeys = new Set();
   for (const id of ['makeRoom', 'joinRoom', 'start']) get(id).disabled = false;
   get('roomCode').value = '';
+  get('roomPin').value = '';
+  showPinField();
   get('roomStatus').textContent = '';
 });
 
