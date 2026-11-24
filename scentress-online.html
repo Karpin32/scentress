@@ -588,6 +588,12 @@ function roomLabel(room) {
   return room.private ? '🔒 ' + room.title : room.title;
 }
 
+function isAvailableRoom(room, now, ownUid) {
+  return !!room && room.owner !== ownUid && room.expires > now &&
+    Number.isFinite(room.lastSeen) && room.lastSeen > 0 &&
+    room.lastSeen >= now - 15000 && room.lastSeen <= now + 5000;
+}
+
 const TRIP_LIMIT = 30000;
 const MATCH_LIMIT = 60000;
 const COUNTDOWN = 3000;
@@ -1015,6 +1021,7 @@ let inputSequence = Date.now() * 1000;
 let writePending = false;
 let listedRooms = new Map();
 let unsubscribeLobby;
+let lobbyRefresh;
 const SESSION_KEY = 'scentress-online-session';
 const sdk = 'https://www.gstatic.com/firebasejs/11.10.0/';
 
@@ -1149,7 +1156,10 @@ function watchConnection(path) {
   }, networkError));
   session.subscriptions.push(service.onValue(refInfo('connected'), snapshot => {
     session.connected = false;
-    if (!snapshot.val() || room !== session) return;
+    if (!snapshot.val() || room !== session) {
+      session.lobbyDisconnect = undefined;
+      return;
+    }
     const stamp = service.serverTimestamp();
     const disconnect = service.onDisconnect(own);
     disconnect.update({ online: false, lostAt: stamp }).then(async () => {
@@ -1158,9 +1168,23 @@ function watchConnection(path) {
       if (room !== session) return;
       session.connected = true;
       session.disconnect = disconnect;
+      renewLobbyListing(session);
       maybeStartHost();
     }).catch(networkError);
   }));
+}
+
+function renewLobbyListing(session) {
+  if (room !== session || session.side !== 0 || !session.connected ||
+      session.guestCharacter !== undefined || session.leaving || game) return;
+  const { service, code } = session;
+  const listing = service.ref(service.database, 'lobbyRooms/' + code);
+  if (!session.lobbyDisconnect) {
+    const afterDisconnect = service.onDisconnect(listing);
+    session.lobbyDisconnect = afterDisconnect;
+    void afterDisconnect.update({ lastSeen: 0 }).catch(() => {});
+  }
+  void service.update(listing, { lastSeen: service.serverTimestamp() }).catch(() => {});
 }
 
 function maybeStartHost() {
@@ -1172,11 +1196,15 @@ function maybeStartHost() {
 
 function watchHost(path, character) {
   room.hostCharacter = character;
-  const { service } = room;
+  const session = room;
+  const { service } = session;
+  const listingTimer = setInterval(() => renewLobbyListing(session), 5000);
+  session.subscriptions.push(() => clearInterval(listingTimer));
   room.subscriptions.push(service.onValue(path('guest'), snapshot => {
     const guest = snapshot.val();
     if (!guest) return;
     room.guestCharacter = guest.character;
+    session.lobbyDisconnect?.cancel().catch(() => {});
     if (!game) service.remove(service.ref(service.database, 'lobbyRooms/' + room.code)).catch(networkError);
     maybeStartHost();
   }, networkError));
@@ -1231,6 +1259,7 @@ function showWaitingRoom(character, side, privateRoom) {
 function returnToSetup(session) {
   session.subscriptions.forEach(unsubscribe => unsubscribe());
   session.disconnect?.cancel().catch(() => {});
+  session.lobbyDisconnect?.cancel().catch(() => {});
   if (room === session) room = undefined;
   forgetRoom();
   remoteKeys.clear();
@@ -1280,7 +1309,10 @@ async function createRoom() {
   const expires = Date.now() + 7200000;
   const entries = {
     ['testRooms/' + code + '/host']: { uid: service.uid, character, expires, private: privateRoom },
-    ['lobbyRooms/' + code]: { title: '스핑크스 대전 · ' + characters[character].name, private: privateRoom, expires, owner: service.uid },
+    ['lobbyRooms/' + code]: {
+      title: '스핑크스 대전 · ' + characters[character].name, private: privateRoom, expires,
+      owner: service.uid, lastSeen: service.serverTimestamp(),
+    },
   };
   if (privateRoom) entries['testRooms/' + code + '/pin'] = pin;
   await service.update(service.ref(service.database), entries);
@@ -1392,20 +1424,36 @@ get('loadRooms').onclick = async () => {
   try {
     const service = await connect();
     unsubscribeLobby?.();
+    clearInterval(lobbyRefresh);
     const listQuery = service.query(service.ref(service.database, 'lobbyRooms'),
-      service.orderByChild('expires'), service.startAt(Date.now()), service.limitToLast(25));
-    unsubscribeLobby = service.onValue(listQuery, snapshot => {
+      service.orderByChild('lastSeen'), service.startAt(1), service.limitToLast(25));
+    let snapshotRooms = new Map();
+    let offset = 0;
+    function updateList() {
       const selection = get('roomList').value;
-      listedRooms = new Map();
-      snapshot.forEach(item => {
-        if (item.val().expires > Date.now() && item.val().owner !== service.uid) listedRooms.set(item.key, item.val());
-      });
+      const now = Date.now() + offset;
+      const readyRooms = new Map([...snapshotRooms].filter(([, entry]) => isAvailableRoom(entry, now, service.uid)));
+      const changed = readyRooms.size !== listedRooms.size ||
+        [...readyRooms.keys()].some(code => !listedRooms.has(code));
+      listedRooms = readyRooms;
       const list = get('roomList');
-      list.replaceChildren(new Option(listedRooms.size ? '대기 중인 방 선택' : '대기 중인 방 없음', ''));
+      const placeholder = listedRooms.size ? '대기 중인 방 선택' : '대기 중인 방 없음';
+      if (!changed && list.options[0]?.text === placeholder) return;
+      list.replaceChildren(new Option(placeholder, ''));
       for (const [code, details] of listedRooms) list.add(new Option(roomLabel(details), code));
       if (listedRooms.has(selection)) list.value = selection;
       showPinField();
+    }
+    const unsubscribeOffset = service.onValue(service.ref(service.database, '.info/serverTimeOffset'), snapshot => {
+      offset = snapshot.val() ?? 0;
+      updateList();
+    });
+    const unsubscribeRooms = service.onValue(listQuery, snapshot => {
+      snapshotRooms = new Map(Object.entries(snapshot.val() ?? {}));
+      updateList();
     }, networkError);
+    unsubscribeLobby = () => { unsubscribeOffset(); unsubscribeRooms(); };
+    lobbyRefresh = setInterval(updateList, 1000);
   } catch (error) {
     networkError(error);
   }
