@@ -23,6 +23,8 @@
 .room-list select { min-width: 0; max-width: 100%; }
 .room-status { color: #ffdc9c; font-weight: 650; overflow-wrap: anywhere; }
 .room-status:empty { display: none; }
+.waiting-panel p { grid-column: 1 / -1; }
+.waiting-panel #waitingMessage { color: #ffdc9c; }
 body.game-rotated { overflow: hidden; }
 body.game-rotated main {
   padding: 8px;
@@ -115,17 +117,13 @@ body.game-rotated #roomCode { flex-basis: 8em; }
     </div>
   </div>
   <div class="overlay" id="setup">
-    <div class="panel">
+    <div class="panel" id="setupPanel">
       
       <h2>스핑크스 · 2인 온라인 테스트</h2>
       <div class="choices"><label>플레이어 1<select id="left"></select></label><label>플레이어 2<select id="right"></select></label></div>
             <button class="primary" id="start">로컬 대전 시작</button>
       <small id="roomStatus" class="room-status" role="status"></small>
       <div class="actions"><button id="makeRoom">온라인 방 만들기 (P1)</button><button id="joinRoom">방 참가 (P2)</button></div>
-      <div class="actions">
-        <input class="room-code" id="roomCode" aria-label="방 코드" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="24" placeholder="방 코드">
-        <button id="copyRoom">코드 복사</button>
-      </div>
       <div class="actions room-options">
         <select id="visibility" aria-label="방 공개 설정"><option value="public">공개방</option><option value="private">비공개방</option></select>
         <input class="room-code" id="roomPin" type="password" inputmode="numeric" maxlength="4" autocomplete="off" aria-label="비밀번호 4자리" placeholder="비밀번호 4자리" hidden>
@@ -134,6 +132,11 @@ body.game-rotated #roomCode { flex-basis: 8em; }
         <select id="roomList" aria-label="대기 중인 방"><option value="">대기 중인 방 선택</option></select>
         <button id="loadRooms">방 목록 새로고침</button>
       </div>
+    </div>
+        <div class="panel waiting-panel" id="waitingRoom" hidden>
+      <h2 id="waitingTitle">온라인 대기방</h2>
+      <p id="waitingPlayer"></p>
+      <p id="waitingMessage" role="status"></p>
     </div>
   </div>
   <div class="overlay" id="ending" hidden>
@@ -1037,6 +1040,16 @@ function openRoom(service, code, side) {
   return pathRef;
 }
 
+function showWaitingRoom(character, side, privateRoom) {
+  get('waitingTitle').textContent = privateRoom ? '🔒 비공개 대기방' : '온라인 대기방';
+  get('waitingPlayer').textContent = '플레이어 ' + (side + 1) + ' · ' + characters[character].name;
+  get('waitingMessage').textContent = side === 0
+    ? '상대가 방 목록에서 참가하면 바로 경기가 시작돼요.'
+    : '방에 참가했어요. 경기를 연결하는 중…';
+  get('setupPanel').hidden = true;
+  get('waitingRoom').hidden = false;
+}
+
 async function createRoom() {
   const privateRoom = get('visibility').value === 'private';
   const pin = get('roomPin').value;
@@ -1058,11 +1071,7 @@ async function createRoom() {
   if (privateRoom) entries['testRooms/' + code + '/pin'] = pin;
   await service.update(service.ref(service.database), entries);
   get('roomPin').value = '';
-  get('roomCode').value = code;
-  get('makeRoom').textContent = '방 만들기 완료';
-  get('roomStatus').textContent = privateRoom
-    ? '비공개방을 만들었어요. 상대가 방 목록에서 선택하고 비밀번호를 입력하면 시작돼요.'
-    : '공개방을 만들었어요. 상대가 방 목록에서 참가하면 시작돼요.';
+  showWaitingRoom(character, 0, privateRoom);
   room.subscriptions.push(service.onValue(path('guest'), snapshot => {
     const guest = snapshot.val();
     if (!guest || game) return;
@@ -1087,14 +1096,14 @@ async function createRoom() {
 }
 
 async function joinRoom() {
-  const code = get('roomCode').value.trim().toLowerCase();
-  if (!/^[a-f0-9]{24}$/.test(code)) {
-    get('roomStatus').textContent = '받은 방 코드 24자를 입력해 주세요.';
+  const code = get('roomList').value;
+  const roomInfo = listedRooms.get(code);
+  if (!roomInfo) {
+    get('roomStatus').textContent = '방 목록에서 참가할 방을 먼저 선택해 주세요.';
     return;
   }
   const pin = get('roomPin').value;
-  const roomInfo = listedRooms.get(code);
-  if ((roomInfo?.private || pin !== '') && !isRoomPin(pin)) {
+  if (roomInfo.private && !isRoomPin(pin)) {
     get('roomStatus').textContent = '비밀번호는 숫자 4자리로 입력해 주세요.';
     get('roomPin').hidden = false;
     get('roomPin').focus();
@@ -1102,12 +1111,13 @@ async function joinRoom() {
   }
   const service = await connect();
   const path = openRoom(service, code, 1);
-  if (isRoomPin(pin)) {
+  const character = selected('right');
+  if (roomInfo.private) {
     await service.set(path('attempt'), { uid: service.uid, pin, at: service.serverTimestamp() });
   }
-  await service.set(path('guest'), { uid: service.uid, character: selected('right') });
+  await service.set(path('guest'), { uid: service.uid, character });
   get('roomPin').value = '';
-  get('roomStatus').textContent = '방장과 연결하는 중…';
+  showWaitingRoom(character, 1, roomInfo.private);
   room.subscriptions.push(service.onValue(room.frame, snapshot => {
     if (!snapshot.exists()) return;
     const frame = JSON.parse(snapshot.val());
@@ -1146,15 +1156,11 @@ function runRoomAction(action) {
 get('makeRoom').onclick = runRoomAction(createRoom);
 get('joinRoom').onclick = runRoomAction(joinRoom);
 function showPinField() {
-  const info = listedRooms.get(get('roomCode').value.trim().toLowerCase());
+  const info = listedRooms.get(get('roomList').value);
   get('roomPin').hidden = get('visibility').value !== 'private' && !info?.private;
 }
 get('visibility').onchange = showPinField;
-get('roomCode').oninput = showPinField;
 get('roomList').onchange = () => {
-  const selectedRoom = get('roomList').value;
-  if (!selectedRoom) return;
-  get('roomCode').value = selectedRoom;
   get('roomPin').value = '';
   showPinField();
 };
@@ -1174,28 +1180,24 @@ get('loadRooms').onclick = async () => {
       list.replaceChildren(new Option(listedRooms.size ? '대기 중인 방 선택' : '대기 중인 방 없음', ''));
       for (const [code, details] of listedRooms) list.add(new Option(roomLabel(details), code));
       if (listedRooms.has(selection)) list.value = selection;
+      showPinField();
     }, networkError);
   } catch (error) {
     networkError(error);
   }
-};
-get('copyRoom').onclick = async () => {
-  const input = get('roomCode');
-  input.select();
-  try { await navigator.clipboard.writeText(input.value); }
-  catch { get('roomStatus').textContent = '선택된 방 코드를 직접 복사해 주세요.'; }
 };
 get('replay').addEventListener('click', () => {
   if (!room) return;
   room.subscriptions.forEach(unsubscribe => unsubscribe());
   room = undefined;
   remoteKeys = new Set();
-  get('makeRoom').textContent = '온라인 방 만들기 (P1)';
   for (const id of ['makeRoom', 'joinRoom', 'start']) get(id).disabled = false;
-  get('roomCode').value = '';
+  get('roomList').value = '';
   get('roomPin').value = '';
   showPinField();
   get('roomStatus').textContent = '';
+  get('waitingRoom').hidden = true;
+  get('setupPanel').hidden = false;
 });
 
 </script>
