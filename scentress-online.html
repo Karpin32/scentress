@@ -139,6 +139,9 @@ body.game-rotated #roomCode { flex-basis: 8em; }
       <p id="waitingMessage" role="status"></p>
     </div>
   </div>
+  <div class="overlay" id="connectionOverlay" hidden>
+    <div class="panel"><h2>연결 확인 중</h2><p id="connectionStatus" role="status"></p></div>
+  </div>
   <div class="overlay" id="ending" hidden>
     <div class="panel"><h2 id="winner"></h2><p id="summary"></p><button class="primary" id="replay">캐릭터 선택으로</button></div>
   </div>
@@ -555,7 +558,7 @@ class Arena {
 
 
 const frameFields = ['active', 'turn', 'phase', 'remaining', 'charge', 'charging',
-  'wind', 'pillar', 'shot', 'blast', 'notice', 'pause', 'result'];
+  'wind', 'pillar', 'shot', 'blast', 'notice', 'pause', 'result', 'reconnectUsed', 'reconnectHandled'];
 
 function packArena(arena) {
   const frame = Object.fromEntries(frameFields.map(key => [key, arena[key] ?? null]));
@@ -581,6 +584,35 @@ function isRoomPin(value) {
 
 function roomLabel(room) {
   return room.private ? '🔒 ' + room.title : room.title;
+}
+
+const TRIP_LIMIT = 30000;
+const MATCH_LIMIT = 60000;
+const COUNTDOWN = 3000;
+
+function reconnectState(players, now, used = 0, handled = 0) {
+  if (!players[0] || !players[1]) return { phase: 'waiting', seconds: null };
+  const losses = players.map(player => player.lostAt ?? 0);
+  const pending = losses.filter(loss => loss > handled);
+  if (!pending.length) {
+    return players.every(player => player.online) ? { phase: 'playing' } : { phase: 'waiting', seconds: null };
+  }
+  const start = Math.min(...pending);
+  const deadline = start + Math.min(TRIP_LIMIT, Math.max(0, MATCH_LIMIT - used));
+  const missed = players.map((player, index) => losses[index] > handled &&
+    (!player.online || player.returnedAt > deadline));
+  if (now >= deadline && missed.some(Boolean)) {
+    return { phase: 'forfeit', result: missed[0] && missed[1] ? 'void' : missed[0] ? 'right' : 'left' };
+  }
+  if (!players.every(player => player.online)) {
+    return { phase: 'waiting', seconds: Math.max(0, Math.ceil((deadline - now) / 1000)) };
+  }
+  const returned = Math.max(...players.filter((_, index) => losses[index] > handled)
+    .map(player => player.returnedAt));
+  if (now < returned + COUNTDOWN) {
+    return { phase: 'countdown', seconds: Math.ceil((returned + COUNTDOWN - now) / 1000) };
+  }
+  return { phase: 'resume', used: used + Math.max(0, returned - start), handled: Math.max(...pending) };
 }
 
 const get = id => document.getElementById(id);
@@ -921,6 +953,11 @@ function frame(now) {
   if (game && !game.result) {
     const networked = typeof onlineMode === 'function' && onlineMode();
     const isPressed = networked ? onlinePressed : pressed;
+    if (networked && !onlineCanAdvance(now)) {
+      render();
+      requestAnimationFrame(frame);
+      return;
+    }
     if (networked && onlineSpectator()) {
       render();
       requestAnimationFrame(frame);
@@ -943,15 +980,21 @@ function frame(now) {
     render();
     if (networked) publishOnlineFrame(now);
     if (game.result) {
-      music.pause();
-      get('music').textContent = '음악 켜기';
-      get('winner').textContent = game.result === 'draw' ? '무승부' : '플레이어 ' + (game.result === 'left' ? '1' : '2') + ' 승리';
-      get('summary').textContent = game.players.map(player => player.character.name + ' ' + player.hp + '/' + player.maxHp + ' HP').join(' · ');
-      get('ending').hidden = false;
-      get('controls').hidden = true;
+      showMatchResult();
     }
   }
   requestAnimationFrame(frame);
+}
+function showMatchResult() {
+  music.pause();
+  get('music').textContent = '음악 켜기';
+  const winner = game.result === 'left' ? '1' : '2';
+  get('winner').textContent = game.result === 'void' ? '경기 무효'
+    : game.result === 'draw' ? '무승부' : '플레이어 ' + winner + ' 승리';
+  get('summary').textContent = game.players.map(player => player.character.name + ' ' + player.hp + '/' + player.maxHp + ' HP').join(' · ');
+  get('connectionOverlay').hidden = true;
+  get('ending').hidden = false;
+  get('controls').hidden = true;
 }
 requestAnimationFrame(frame);
 
@@ -966,10 +1009,11 @@ let connection;
 let room;
 let remoteKeys = new Set();
 let lastFrame = 0;
-let inputSequence = 0;
+let inputSequence = Date.now() * 1000;
 let writePending = false;
 let listedRooms = new Map();
 let unsubscribeLobby;
+const SESSION_KEY = 'scentress-online-session';
 const sdk = 'https://www.gstatic.com/firebasejs/11.10.0/';
 
 function connect() {
@@ -995,6 +1039,7 @@ function onlinePressed(key) {
 
 function routeOnlineKey(key, down) {
   if (!room) return false;
+  if (room.paused || !room.connected) return true;
   if (room.side === 0) return game.active !== 0;
   if (game.active !== 1 || game.result) return true;
   const keysDown = [...inputs].filter(pressed);
@@ -1011,12 +1056,12 @@ function networkError(error) {
     get('notice').hidden = false;
     get('notice').textContent = game.notice;
   } else {
-    get('roomStatus').textContent = '연결을 확인하거나 새 방 코드를 받아 다시 시도해 주세요.';
+    get('roomStatus').textContent = '연결을 확인하고 방 목록에서 다시 시도해 주세요.';
   }
 }
 
 function publishOnlineFrame(now) {
-  if (room.side !== 0 || writePending || (!game.result && now - lastFrame < 85)) return;
+  if (room.side !== 0 || !room.connected || writePending || (!game.result && now - lastFrame < 85)) return;
   lastFrame = now;
   writePending = true;
   const currentRoom = room;
@@ -1036,8 +1081,137 @@ function publishOnlineFrame(now) {
 function openRoom(service, code, side) {
   const path = 'testRooms/' + code + '/';
   const pathRef = name => service.ref(service.database, path + name);
-  room = { code, side, service, input: pathRef('input'), frame: pathRef('frame'), subscriptions: [] };
+  room = {
+    code, side, service, input: pathRef('input'), frame: pathRef('frame'),
+    subscriptions: [], presence: null, connected: false, paused: true, timeOffset: 0,
+  };
   return pathRef;
+}
+
+function onlineCanAdvance(now) {
+  const participants = room.presence ?? {};
+  const decision = room.connected
+    ? reconnectState([participants.host, participants.guest], Date.now() + room.timeOffset,
+      game.reconnectUsed ?? 0, game.reconnectHandled ?? 0)
+    : { phase: 'waiting', seconds: null };
+  if (decision.phase === 'forfeit') {
+    game.result = decision.result;
+    game.phase = 'result';
+    if (room.side === 0) publishOnlineFrame(now);
+    showMatchResult();
+    return false;
+  }
+  const active = decision.phase === 'playing' || decision.phase === 'resume';
+  if (decision.phase === 'resume' && room.side === 0) {
+    game.reconnectUsed = decision.used;
+    game.reconnectHandled = decision.handled;
+  }
+  if (!active && !room.paused) {
+    keys.clear();
+    remoteKeys.clear();
+  }
+  room.paused = !active;
+  get('connectionOverlay').hidden = active;
+  if (!active) {
+    get('connectionStatus').textContent = decision.phase === 'countdown'
+      ? decision.seconds + '초 뒤 경기를 다시 시작해요.'
+      : decision.seconds === null ? '연결이 복구되기를 기다리는 중이에요.'
+        : '상대의 재접속을 기다리는 중이에요. ' + decision.seconds + '초 남았어요.';
+  }
+  return active;
+}
+
+function rememberRoom(session) {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify({
+      code: session.code, side: session.side, uid: session.service.uid,
+    }));
+  } catch {}
+}
+
+function forgetRoom() {
+  try { localStorage.removeItem(SESSION_KEY); } catch {}
+}
+
+function watchConnection(path) {
+  const session = room;
+  const { service } = session;
+  const refInfo = name => service.ref(service.database, '.info/' + name);
+  const own = path('presence/' + (session.side === 0 ? 'host' : 'guest'));
+  session.subscriptions.push(service.onValue(refInfo('serverTimeOffset'), snapshot => {
+    session.timeOffset = snapshot.val() ?? 0;
+  }));
+  session.subscriptions.push(service.onValue(path('presence'), snapshot => {
+    session.presence = snapshot.val();
+    maybeStartHost();
+  }, networkError));
+  session.subscriptions.push(service.onValue(refInfo('connected'), snapshot => {
+    session.connected = false;
+    if (!snapshot.val() || room !== session) return;
+    const stamp = service.serverTimestamp();
+    const disconnect = service.onDisconnect(own);
+    disconnect.update({ online: false, lostAt: stamp }).then(async () => {
+      if (room !== session) { await disconnect.cancel(); return; }
+      await service.update(own, { online: true, returnedAt: stamp });
+      if (room !== session) return;
+      session.connected = true;
+      session.disconnect = disconnect;
+      maybeStartHost();
+    }).catch(networkError);
+  }));
+}
+
+function maybeStartHost() {
+  if (room?.side !== 0 || game || !room.connected || room.restoring ||
+      !room.presence?.guest?.online || room.guestCharacter === undefined) return;
+  startArena(new Arena([room.hostCharacter, room.guestCharacter]));
+  publishOnlineFrame(performance.now() + 100);
+}
+
+function watchHost(path, character) {
+  room.hostCharacter = character;
+  const { service } = room;
+  room.subscriptions.push(service.onValue(path('guest'), snapshot => {
+    const guest = snapshot.val();
+    if (!guest) return;
+    room.guestCharacter = guest.character;
+    if (!game) service.remove(service.ref(service.database, 'lobbyRooms/' + room.code)).catch(networkError);
+    maybeStartHost();
+  }, networkError));
+  room.subscriptions.push(service.onValue(room.input, snapshot => {
+    if (!snapshot.exists() || !game || game.active !== 1 || game.result || room.paused) return;
+    const input = JSON.parse(snapshot.val());
+    if (input.turn !== game.turn || input.sequence <= (room.sequence ?? 0) ||
+        !Array.isArray(input.keysDown)) return;
+    room.sequence = input.sequence;
+    remoteKeys = new Set(input.keysDown.filter(key => inputs.has(key)));
+    if (input.key === 'Space') {
+      if (input.down) game.pressFire();
+      else game.releaseFire();
+    }
+    if (input.down && input.key === 'ArrowUp') game.adjust(1);
+    if (input.down && input.key === 'ArrowDown') game.adjust(-1);
+  }, networkError));
+}
+
+function applyFrame(frame) {
+  if (game?.result && !frame.result) return;
+  if (!game) startArena(new Arena(frame.players.map(player => player.characterId)));
+  const previousTurn = game.turn;
+  const wasResult = game.result;
+  restoreArena(game, frame);
+  if (game.turn !== previousTurn || game.phase === 'flight' || game.phase === 'blast') follow = true;
+  if (game.result && !wasResult) {
+    render();
+    showMatchResult();
+  }
+}
+
+function watchGuest() {
+  const { service, frame } = room;
+  room.subscriptions.push(service.onValue(frame, snapshot => {
+    if (snapshot.exists()) applyFrame(JSON.parse(snapshot.val()));
+  }, networkError));
 }
 
 function showWaitingRoom(character, side, privateRoom) {
@@ -1072,27 +1246,9 @@ async function createRoom() {
   await service.update(service.ref(service.database), entries);
   get('roomPin').value = '';
   showWaitingRoom(character, 0, privateRoom);
-  room.subscriptions.push(service.onValue(path('guest'), snapshot => {
-    const guest = snapshot.val();
-    if (!guest || game) return;
-    service.remove(service.ref(service.database, 'lobbyRooms/' + code)).catch(networkError);
-    startArena(new Arena([character, guest.character]));
-    publishOnlineFrame(performance.now() + 100);
-  }, networkError));
-  room.subscriptions.push(service.onValue(room.input, snapshot => {
-    if (!snapshot.exists() || !game || game.active !== 1 || game.result) return;
-    const input = JSON.parse(snapshot.val());
-    if (input.turn !== game.turn || input.sequence <= (room.sequence ?? 0) ||
-        !Array.isArray(input.keysDown)) return;
-    room.sequence = input.sequence;
-    remoteKeys = new Set(input.keysDown.filter(key => inputs.has(key)));
-    if (input.key === 'Space') {
-      if (input.down) game.pressFire();
-      else game.releaseFire();
-    }
-    if (input.down && input.key === 'ArrowUp') game.adjust(1);
-    if (input.down && input.key === 'ArrowDown') game.adjust(-1);
-  }, networkError));
+  rememberRoom(room);
+  watchHost(path, character);
+  watchConnection(path);
 }
 
 async function joinRoom() {
@@ -1118,22 +1274,49 @@ async function joinRoom() {
   await service.set(path('guest'), { uid: service.uid, character });
   get('roomPin').value = '';
   showWaitingRoom(character, 1, roomInfo.private);
-  room.subscriptions.push(service.onValue(room.frame, snapshot => {
-    if (!snapshot.exists()) return;
-    const frame = JSON.parse(snapshot.val());
-    if (!game) startArena(new Arena(frame.players.map(player => player.characterId)));
-    const previousTurn = game.turn;
-    const wasResult = game.result;
-    restoreArena(game, frame);
-    if (game.turn !== previousTurn || game.phase === 'flight' || game.phase === 'blast') follow = true;
-    if (game.result && !wasResult) {
-      render();
-      get('winner').textContent = game.result === 'draw' ? '무승부' : '플레이어 ' + (game.result === 'left' ? '1' : '2') + ' 승리';
-      get('summary').textContent = game.players.map(player => player.character.name + ' ' + player.hp + '/' + player.maxHp + ' HP').join(' · ');
-      get('ending').hidden = false;
-      get('controls').hidden = true;
+  rememberRoom(room);
+  watchGuest();
+  watchConnection(path);
+}
+
+async function restoreRoom() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SESSION_KEY)); } catch { return; }
+  if (!saved || !/^[a-f0-9]{24}$/.test(saved.code) || ![0, 1].includes(saved.side)) return;
+  for (const id of ['makeRoom', 'joinRoom', 'start']) get(id).disabled = true;
+  get('roomStatus').textContent = '이전 온라인 경기에 다시 연결하는 중…';
+  try {
+    const service = await connect();
+    if (service.uid !== saved.uid) throw Error('Session identity changed');
+    const path = openRoom(service, saved.code, saved.side);
+    room.restoring = true;
+    const self = saved.side === 0 ? 'host' : 'guest';
+    const [membership, host] = await Promise.all([service.get(path(self)), service.get(path('host'))]);
+    if (membership.val()?.uid !== service.uid || host.val()?.expires <= Date.now()) {
+      throw Error('The saved room is unavailable');
     }
-  }, networkError));
+    showWaitingRoom(membership.val().character, saved.side, Boolean(host.val().private));
+    if (saved.side === 0) {
+      const guest = await service.get(path('guest'));
+      if (guest.exists()) {
+        const frame = await service.get(room.frame);
+        if (frame.exists()) applyFrame(JSON.parse(frame.val()));
+      }
+      watchHost(path, membership.val().character);
+    } else {
+      watchGuest();
+    }
+    room.restoring = false;
+    watchConnection(path);
+  } catch (error) {
+    room?.subscriptions.forEach(unsubscribe => unsubscribe());
+    room = undefined;
+    forgetRoom();
+    get('setupPanel').hidden = false;
+    get('waitingRoom').hidden = true;
+    get('roomStatus').textContent = '이전 방에 다시 연결할 수 없어요. 새 방에서 시작해 주세요.';
+    for (const id of ['makeRoom', 'joinRoom', 'start']) get(id).disabled = false;
+  }
 }
 
 function runRoomAction(action) {
@@ -1189,6 +1372,7 @@ get('loadRooms').onclick = async () => {
 get('replay').addEventListener('click', () => {
   if (!room) return;
   room.subscriptions.forEach(unsubscribe => unsubscribe());
+  forgetRoom();
   room = undefined;
   remoteKeys = new Set();
   for (const id of ['makeRoom', 'joinRoom', 'start']) get(id).disabled = false;
@@ -1199,6 +1383,7 @@ get('replay').addEventListener('click', () => {
   get('waitingRoom').hidden = true;
   get('setupPanel').hidden = false;
 });
+void restoreRoom();
 
 </script>
 </html>
