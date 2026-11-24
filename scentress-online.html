@@ -150,7 +150,25 @@ body.game-rotated #roomCode { flex-basis: 8em; }
     <div class="panel"><h2>연결 확인 중</h2><p id="connectionStatus" role="status"></p></div>
   </div>
   <div class="overlay" id="ending" hidden>
-    <div class="panel"><h2 id="winner"></h2><p id="summary"></p><button class="primary" id="replay">캐릭터 선택으로</button></div>
+    <div class="panel"><h2 id="winner"></h2><p id="summary"></p>
+      <div id="rematchActions" hidden>
+        <p id="rematchStatus" role="status"></p>
+        <button class="primary" id="rematchOffer" type="button">재대결 신청</button>
+      </div>
+      <button id="replay">캐릭터 선택으로</button>
+    </div>
+  </div>
+    <div class="overlay" id="rematchSelection" hidden>
+    <div class="panel">
+      <h2>재대결 캐릭터 선택</h2>
+      <label for="rematchCharacter">내 캐릭터</label>
+      <select id="rematchCharacter"></select>
+      <p id="rematchSelectionStatus" role="status"></p>
+      <div class="actions">
+        <button class="primary" id="rematchReady" type="button">선택 완료</button>
+        <button id="rematchCancel" type="button">초기 화면으로</button>
+      </div>
+    </div>
   </div>
 </section>
 <div class="controls" id="controls" hidden>
@@ -565,7 +583,8 @@ class Arena {
 
 
 const frameFields = ['active', 'turn', 'phase', 'remaining', 'charge', 'charging',
-  'wind', 'pillar', 'shot', 'blast', 'notice', 'pause', 'result', 'reconnectUsed', 'reconnectHandled', 'resigned'];
+  'wind', 'pillar', 'shot', 'blast', 'notice', 'pause', 'result',
+  'reconnectUsed', 'reconnectHandled', 'resigned', 'first', 'seriesRound'];
 
 function packArena(arena) {
   const frame = Object.fromEntries(frameFields.map(key => [key, arena[key] ?? null]));
@@ -628,6 +647,25 @@ function reconnectState(players, now, used = 0, handled = 0) {
   return { phase: 'resume', used: used + Math.max(0, returned - start), handled: Math.max(...pending) };
 }
 
+const REMATCH_LIMIT = 30000;
+
+function rematchStatus(votes, now) {
+  const host = votes?.host;
+  const guest = votes?.guest;
+  if (host?.declined || guest?.declined) return { phase: 'declined' };
+  const accepted = [host?.acceptedAt, guest?.acceptedAt].filter(Number.isFinite);
+  if (!accepted.length) return { phase: 'idle' };
+  const deadline = Math.min(...accepted) + REMATCH_LIMIT;
+  if (accepted.length < 2) {
+    return now >= deadline ? { phase: 'expired' } : { phase: 'offered', deadline };
+  }
+  if (Math.max(...accepted) > deadline) return { phase: 'expired' };
+  if (![host.character, guest.character].every(id => Number.isInteger(id) && id >= 0 && id <= 5)) {
+    return { phase: 'select' };
+  }
+  return { phase: 'ready', characters: [host.character, guest.character] };
+}
+
 const get = id => document.getElementById(id);
 const field = get('field');
 const draw = field.getContext('2d');
@@ -678,6 +716,7 @@ function startArena(arena) {
   get('stage').classList.remove('setup-open');
   get('setup').hidden = true;
   get('ending').hidden = true;
+  if (get('rematchSelection')) get('rematchSelection').hidden = true;
   get('controls').hidden = false;
   get('hud').hidden = false;
   get('leaveMatch').hidden = false;
@@ -693,6 +732,7 @@ function showSetupScreen() {
   draw.clearRect(0, 0, field.width, field.height);
   get('hud').hidden = true;
   get('ending').hidden = true;
+  if (get('rematchSelection')) get('rematchSelection').hidden = true;
   get('controls').hidden = true;
   get('leaveMatch').hidden = true;
   get('connectionOverlay').hidden = true;
@@ -1025,6 +1065,10 @@ function showMatchResult() {
     : score;
   get('connectionOverlay').hidden = true;
   get('ending').hidden = false;
+  get('replay').textContent = typeof onlineMode === 'function' && onlineMode()
+    ? '초기 화면으로' : '캐릭터 선택으로';
+  get('rematchActions').hidden = true;
+  if (typeof updateRematch === 'function') updateRematch();
   get('controls').hidden = true;
   get('leaveMatch').hidden = true;
 }
@@ -1066,6 +1110,12 @@ function connect() {
 
 function onlineMode() { return Boolean(room); }
 function onlineSpectator() { return room?.side === 1; }
+function seriesRound() { return game?.seriesRound ?? 1; }
+function sideName(session) { return session.side === 0 ? 'host' : 'guest'; }
+function resignationFor(session) {
+  return seriesRound() === 1 ? session.resigned
+    : session.rematches?.[seriesRound()]?.resignation?.side;
+}
 function onlinePressed(key) {
   return game.active === 0 ? pressed(key) : remoteKeys.has(key);
 }
@@ -1077,7 +1127,7 @@ function routeOnlineKey(key, down) {
   if (game.active !== 1 || game.result) return true;
   const keysDown = [...inputs].filter(pressed);
   room.service.set(room.input, JSON.stringify({
-    keysDown, key, down, turn: game.turn, sequence: ++inputSequence,
+    keysDown, key, down, turn: game.turn, round: seriesRound(), sequence: ++inputSequence,
   })).catch(networkError);
   return true;
 }
@@ -1116,7 +1166,7 @@ function openRoom(service, code, side) {
   const pathRef = name => service.ref(service.database, path + name);
   room = {
     code, side, service, input: pathRef('input'), frame: pathRef('frame'), resignation: pathRef('resignation'),
-    subscriptions: [], presence: null, connected: false, paused: true, timeOffset: 0,
+    subscriptions: [], presence: null, connected: false, paused: true, timeOffset: 0, rematches: {},
   };
   return pathRef;
 }
@@ -1175,8 +1225,15 @@ function watchConnection(path) {
   session.subscriptions.push(service.onValue(session.resignation, snapshot => {
     if (!snapshot.exists()) return;
     session.resigned = snapshot.val().side;
-    if (game) applyResignation(session);
+    if (game && seriesRound() === 1) applyResignation(session);
   }, networkError));
+  session.subscriptions.push(service.onValue(path('rematches'), snapshot => {
+    session.rematches = snapshot.val() ?? {};
+    if (game && resignationFor(session)) applyResignation(session);
+    updateRematch();
+  }, networkError));
+  const rematchTimer = setInterval(updateRematch, 250);
+  session.subscriptions.push(() => clearInterval(rematchTimer));
   session.subscriptions.push(service.onValue(refInfo('serverTimeOffset'), snapshot => {
     session.timeOffset = snapshot.val() ?? 0;
   }));
@@ -1221,6 +1278,7 @@ function maybeStartHost() {
   if (room?.side !== 0 || game || !room.connected || room.restoring || room.leaving ||
       !room.presence?.guest?.online || room.guestCharacter === undefined) return;
   startArena(new Arena([room.hostCharacter, room.guestCharacter]));
+  game.seriesRound = 1;
   publishOnlineFrame(performance.now() + 100);
 }
 
@@ -1241,7 +1299,7 @@ function watchHost(path, character) {
   room.subscriptions.push(service.onValue(room.input, snapshot => {
     if (!snapshot.exists() || !game || game.active !== 1 || game.result || room.paused) return;
     const input = JSON.parse(snapshot.val());
-    if (input.turn !== game.turn || input.sequence <= (room.sequence ?? 0) ||
+    if (input.turn !== game.turn || (input.round ?? 1) !== seriesRound() || input.sequence <= (room.sequence ?? 0) ||
         !Array.isArray(input.keysDown)) return;
     room.sequence = input.sequence;
     remoteKeys = new Set(input.keysDown.filter(key => inputs.has(key)));
@@ -1255,12 +1313,17 @@ function watchHost(path, character) {
 }
 
 function applyFrame(frame) {
-  if (game?.result && !frame.result) return;
-  if (!game) startArena(new Arena(frame.players.map(player => player.characterId)));
+  const incomingRound = frame.seriesRound ?? 1;
+  if (game && incomingRound < seriesRound()) return;
+  if (game?.result && !frame.result && incomingRound === seriesRound()) return;
+  if (!game || incomingRound > seriesRound()) {
+    startArena(new Arena(frame.players.map(player => player.characterId)));
+    room.rematchSelection = null;
+  }
   const previousTurn = game.turn;
   const wasResult = game.result;
   restoreArena(game, frame);
-  if (room.resigned && !game.result) applyResignation(room);
+  if (resignationFor(room) && !game.result) { applyResignation(room); return; }
   if (game.turn !== previousTurn || game.phase === 'flight' || game.phase === 'blast') follow = true;
   if (game.result && !wasResult) {
     render();
@@ -1270,8 +1333,9 @@ function applyFrame(frame) {
 
 function applyResignation(session) {
   if (!game || game.result || session.resigning) return;
-  game.resigned = session.resigned;
-  game.result = session.resigned === 'host' ? 'right' : 'left';
+  game.resigned = resignationFor(session);
+  if (!game.resigned) return;
+  game.result = game.resigned === 'host' ? 'right' : 'left';
   game.phase = 'result';
   if (session.side === 0) publishOnlineFrame(performance.now());
   render();
@@ -1291,7 +1355,9 @@ async function resignFromMatch() {
   get('leaveMatch').disabled = true;
   try {
     const { service, side } = session;
-    await service.set(session.resignation, { side: side === 0 ? 'host' : 'guest', uid: service.uid });
+    const target = seriesRound() === 1 ? session.resignation : service.ref(service.database,
+      'testRooms/' + session.code + '/rematches/' + seriesRound() + '/resignation');
+    await service.set(target, { side: side === 0 ? 'host' : 'guest', uid: service.uid });
     music.pause();
     get('music').textContent = '음악 켜기';
     showSetupScreen();
@@ -1299,10 +1365,105 @@ async function resignFromMatch() {
   } catch {
     session.resigning = false;
     get('leaveMatch').disabled = false;
-    if (session.resigned) applyResignation(session);
+    if (resignationFor(session)) applyResignation(session);
     else networkError(Error('Could not record resignation'));
   }
 }
+
+function votePath(session) {
+  return session.service.ref(session.service.database,
+    'testRooms/' + session.code + '/rematches/' + seriesRound() + '/' + sideName(session));
+}
+
+function canOfferRematch(session) {
+  return Boolean(game?.result && game.result !== 'void' && !game.resigned && session?.connected &&
+    session.presence?.host?.online && session.presence?.guest?.online);
+}
+
+function updateRematch() {
+  if (!room || !game?.result) return;
+  const session = room;
+  const round = seriesRound();
+  session.resultRound = round;
+  const votes = session.rematches[round];
+  const order = rematchStatus(votes, Date.now() + session.timeOffset);
+  const actions = get('rematchActions');
+  if (!canOfferRematch(session)) {
+    actions.hidden = true;
+    return;
+  }
+  actions.hidden = false;
+  const mine = votes?.[sideName(session)];
+  const offer = get('rematchOffer');
+  const status = get('rematchStatus');
+  const choosing = order.phase === 'select' || order.phase === 'ready';
+  if (choosing) {
+    if (session.rematchSelection !== round) {
+      session.rematchSelection = round;
+      get('rematchCharacter').value = String(Math.min(4, characters.indexOf(game.players[session.side].character)));
+      get('ending').hidden = true;
+      get('rematchSelection').hidden = false;
+    }
+    const chose = Number.isInteger(mine?.character);
+    get('rematchReady').disabled = Boolean(session.rematchBusy || chose);
+    get('rematchCharacter').disabled = Boolean(session.rematchBusy || chose);
+    get('rematchSelectionStatus').textContent = chose ? '상대가 캐릭터를 선택하는 중이에요.' : '';
+    if (order.phase === 'ready' && session.side === 0) {
+      const next = new Arena(order.characters, Math.random, game.first === 0 ? 1 : 0);
+      next.seriesRound = round + 1;
+      remoteKeys.clear();
+      startArena(next);
+      publishOnlineFrame(performance.now() + 100);
+    }
+    return;
+  }
+  if (session.rematchSelection === round) {
+    session.rematchSelection = null;
+    get('rematchSelection').hidden = true;
+    get('ending').hidden = false;
+  }
+  offer.hidden = order.phase === 'declined' || order.phase === 'expired';
+  offer.disabled = Boolean(session.rematchBusy || mine?.acceptedAt);
+  offer.textContent = order.phase === 'offered'
+    ? (mine?.acceptedAt ? '응답 대기 중' : '재대결 수락') : '재대결 신청';
+  status.textContent = order.phase === 'offered'
+    ? '응답 시간 ' + Math.max(0, Math.ceil((order.deadline - Date.now() - session.timeOffset) / 1000)) + '초'
+    : order.phase === 'expired' ? '재대결 응답 시간이 지났어요.'
+      : order.phase === 'declined' ? '재대결이 취소됐어요.' : '';
+}
+
+async function submitRematch(values, selection = false) {
+  const session = room;
+  if (!canOfferRematch(session) || session.rematchBusy) return;
+  session.rematchBusy = true;
+  updateRematch();
+  try { await session.service.update(votePath(session), values); }
+  catch {
+    get(selection ? 'rematchSelectionStatus' : 'rematchStatus').textContent = '전송하지 못했어요. 다시 시도해 주세요.';
+  } finally {
+    session.rematchBusy = false;
+    if (room === session) updateRematch();
+  }
+}
+
+for (let index = 0; index < 5; index++) {
+  get('rematchCharacter').add(new Option(characters[index].name, index));
+}
+get('rematchCharacter').add(new Option('랜덤', 'random'));
+get('rematchOffer').onclick = () => {
+  if (!room) return;
+  const votes = room.rematches[seriesRound()];
+  const phase = rematchStatus(votes, Date.now() + room.timeOffset).phase;
+  if ((phase === 'idle' || phase === 'offered') && !votes?.[sideName(room)]?.acceptedAt) {
+    void submitRematch({ acceptedAt: room.service.serverTimestamp() });
+  }
+};
+get('rematchReady').onclick = () => {
+  if (room && rematchStatus(room.rematches[seriesRound()], Date.now() + room.timeOffset).phase === 'select') {
+    void submitRematch({ character: selected('rematchCharacter') }, true);
+  }
+};
+get('rematchCancel').onclick = () => get('replay').click();
 
 function watchGuest() {
   const { service, frame } = room;
@@ -1527,7 +1688,14 @@ get('loadRooms').onclick = async () => {
 };
 get('replay').addEventListener('click', () => {
   if (!room) return;
-  returnToSetup(room);
+  const session = room;
+  const phase = rematchStatus(session.rematches[session.resultRound ?? 1], Date.now() + session.timeOffset).phase;
+  if (phase === 'offered' || phase === 'select') {
+    const path = session.service.ref(session.service.database,
+      'testRooms/' + session.code + '/rematches/' + (session.resultRound ?? 1) + '/' + sideName(session));
+    void session.service.update(path, { declined: true }).catch(() => {});
+  }
+  returnToSetup(session);
 });
 void restoreRoom();
 
