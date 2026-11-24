@@ -23,7 +23,8 @@
 .room-list select { min-width: 0; max-width: 100%; }
 .room-status { color: #ffdc9c; font-weight: 650; overflow-wrap: anywhere; }
 .room-status:empty { display: none; }
-.waiting-panel p { grid-column: 1 / -1; }
+.waiting-panel p,
+.waiting-panel #leaveWaitingRoom { grid-column: 1 / -1; }
 .waiting-panel #waitingMessage { color: #ffdc9c; }
 body.game-rotated { overflow: hidden; }
 body.game-rotated main {
@@ -137,6 +138,7 @@ body.game-rotated #roomCode { flex-basis: 8em; }
       <h2 id="waitingTitle">온라인 대기방</h2>
       <p id="waitingPlayer"></p>
       <p id="waitingMessage" role="status"></p>
+      <button id="leaveWaitingRoom" type="button" hidden>나가기</button>
     </div>
   </div>
   <div class="overlay" id="connectionOverlay" hidden>
@@ -1162,7 +1164,7 @@ function watchConnection(path) {
 }
 
 function maybeStartHost() {
-  if (room?.side !== 0 || game || !room.connected || room.restoring ||
+  if (room?.side !== 0 || game || !room.connected || room.restoring || room.leaving ||
       !room.presence?.guest?.online || room.guestCharacter === undefined) return;
   startArena(new Arena([room.hostCharacter, room.guestCharacter]));
   publishOnlineFrame(performance.now() + 100);
@@ -1222,7 +1224,45 @@ function showWaitingRoom(character, side, privateRoom) {
     : '방에 참가했어요. 경기를 연결하는 중…';
   get('setupPanel').hidden = true;
   get('waitingRoom').hidden = false;
+  get('leaveWaitingRoom').hidden = side !== 0;
+  get('leaveWaitingRoom').disabled = false;
 }
+
+function returnToSetup(session) {
+  session.subscriptions.forEach(unsubscribe => unsubscribe());
+  session.disconnect?.cancel().catch(() => {});
+  if (room === session) room = undefined;
+  forgetRoom();
+  remoteKeys.clear();
+  get('roomList').value = '';
+  get('roomPin').value = '';
+  get('roomStatus').textContent = '';
+  get('waitingRoom').hidden = true;
+  get('setupPanel').hidden = false;
+  for (const id of ['makeRoom', 'joinRoom', 'start']) get(id).disabled = false;
+  showPinField();
+}
+
+get('leaveWaitingRoom').onclick = async () => {
+  const session = room;
+  if (session?.side !== 0 || game || session.leaving) return;
+  session.leaving = true;
+  get('leaveWaitingRoom').disabled = true;
+  get('waitingMessage').textContent = '대기방을 닫는 중…';
+  try {
+    const { service, code } = session;
+    await service.update(service.ref(service.database), {
+      ['testRooms/' + code + '/closed']: true,
+      ['lobbyRooms/' + code]: null,
+    });
+    returnToSetup(session);
+  } catch {
+    session.leaving = false;
+    get('leaveWaitingRoom').disabled = false;
+    get('waitingMessage').textContent = '방을 닫지 못했어요. 연결을 확인하고 다시 시도해 주세요.';
+    maybeStartHost();
+  }
+};
 
 async function createRoom() {
   const privateRoom = get('visibility').value === 'private';
@@ -1297,7 +1337,8 @@ async function restoreRoom() {
     }
     showWaitingRoom(membership.val().character, saved.side, Boolean(host.val().private));
     if (saved.side === 0) {
-      const guest = await service.get(path('guest'));
+      const [guest, closed] = await Promise.all([service.get(path('guest')), service.get(path('closed'))]);
+      if (closed.val()) throw Error('The saved room is closed');
       if (guest.exists()) {
         const frame = await service.get(room.frame);
         if (frame.exists()) applyFrame(JSON.parse(frame.val()));
@@ -1371,17 +1412,7 @@ get('loadRooms').onclick = async () => {
 };
 get('replay').addEventListener('click', () => {
   if (!room) return;
-  room.subscriptions.forEach(unsubscribe => unsubscribe());
-  forgetRoom();
-  room = undefined;
-  remoteKeys = new Set();
-  for (const id of ['makeRoom', 'joinRoom', 'start']) get(id).disabled = false;
-  get('roomList').value = '';
-  get('roomPin').value = '';
-  showPinField();
-  get('roomStatus').textContent = '';
-  get('waitingRoom').hidden = true;
-  get('setupPanel').hidden = false;
+  returnToSetup(room);
 });
 void restoreRoom();
 
