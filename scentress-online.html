@@ -20,6 +20,26 @@
   background: #180e22;
   font: inherit;
 }
+body.game-rotated { overflow: hidden; }
+body.game-rotated main {
+  position: fixed;
+  top: 0;
+  left: 100%;
+  width: 100dvh;
+  height: 100dvw;
+  max-width: none;
+  overflow: auto;
+  transform: rotate(90deg);
+  transform-origin: top left;
+  background: #180e22;
+}
+body.game-rotated main header { margin-bottom: 6px; }
+body.game-rotated .stage:not(.setup-open) {
+  min-height: 0;
+  max-width: calc((100dvw - 115px) * 19.5 / 9);
+  margin-inline: auto;
+}
+body.game-rotated footer { display: none; }
 @media (max-width: 700px), (pointer: coarse) {
   .stage.setup-open { aspect-ratio: auto; }
   .stage.setup-open canvas { display: none; }
@@ -578,11 +598,39 @@ get('music').onclick = async () => {
   }
 };
 
-function fullscreen() {
-  const operation = document.fullscreenElement
-    ? document.exitFullscreen() : document.querySelector('main').requestFullscreen();
-  operation.catch(() => {});
+const mobileScreen = matchMedia('(pointer: coarse), (max-width: 700px)');
+const portrait = matchMedia('(orientation: portrait)');
+let wideMode = false;
+
+function reflectOrientation() {
+  document.body.classList.toggle('game-rotated', wideMode && portrait.matches);
+  get('full').textContent = wideMode || document.fullscreenElement ? '전체화면 닫기' : '전체화면';
 }
+
+async function fullscreen() {
+  const main = document.querySelector('main');
+  if (wideMode || document.fullscreenElement) {
+    wideMode = false;
+    screen.orientation?.unlock?.();
+    reflectOrientation();
+    try { if (document.fullscreenElement) await document.exitFullscreen(); } catch {}
+    return;
+  }
+  if (mobileScreen.matches) wideMode = true;
+  try { await main.requestFullscreen?.(); } catch {}
+  if (wideMode && portrait.matches && document.fullscreenElement) {
+    try { await screen.orientation?.lock?.('landscape'); } catch {}
+  }
+  reflectOrientation();
+}
+portrait.addEventListener('change', reflectOrientation);
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement) {
+    wideMode = false;
+    screen.orientation?.unlock?.();
+  }
+  reflectOrientation();
+});
 get('full').onclick = fullscreen;
 
 function pressed(key) {
@@ -644,8 +692,11 @@ field.onpointerdown = event => {
 field.onpointermove = event => {
   if (!dragging || game?.phase === 'flight') return;
   const unit = viewWidth / field.clientWidth;
-  cameraX -= (event.clientX - drag[0]) * unit;
-  cameraY += (event.clientY - drag[1]) * unit;
+  const dx = event.clientX - drag[0];
+  const dy = event.clientY - drag[1];
+  const rotated = document.body.classList.contains('game-rotated');
+  cameraX -= (rotated ? dy : dx) * unit;
+  cameraY += (rotated ? -dx : dy) * unit;
   drag = [event.clientX, event.clientY];
   follow = false;
 };
