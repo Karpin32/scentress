@@ -31,6 +31,7 @@
 .stage[data-map="3"] { background: linear-gradient(150deg,#25294e,#445889 62%,#8387be); }
 .stage[data-map="4"] { background: linear-gradient(150deg,#342e66,#85628f 62%,#d9a889); }
 #mapName { display: block; margin-top: 2px; }
+#mapAgreement, #rematchCharacterPanel { display: grid; gap: 7px; }
 .room-status { color: #ffdc9c; font-weight: 650; overflow-wrap: anywhere; }
 .room-status:empty { display: none; }
 .waiting-panel p,
@@ -167,14 +168,21 @@ body.game-rotated #roomCode { flex-basis: 8em; }
     <div class="overlay" id="rematchSelection" hidden>
     <div class="panel">
       <h2>재대결 캐릭터 선택</h2>
+      <div id="mapAgreement" hidden>
+        <p id="mapProposalStatus" role="status"></p>
+        <label class="actions" id="rematchMapLabel">다음 맵 <select id="rematchMap" aria-label="다음 맵"></select></label>
+        <div class="actions">
+          <button id="proposeMap" type="button">맵 제안</button>
+          <button id="acceptMap" type="button" hidden>이 맵으로 진행</button>
+        </div>
+      </div>
+      <div id="rematchCharacterPanel" hidden>
       <label for="rematchCharacter">내 캐릭터</label>
       <select id="rematchCharacter"></select>
-      <label class="actions" id="rematchMapLabel" hidden>다음 맵 <select id="rematchMap" aria-label="다음 맵"></select></label>
       <p id="rematchSelectionStatus" role="status"></p>
-      <div class="actions">
         <button class="primary" id="rematchReady" type="button">선택 완료</button>
-        <button id="rematchCancel" type="button">초기 화면으로</button>
       </div>
+      <button id="rematchCancel" type="button">초기 화면으로</button>
     </div>
   </div>
 </section>
@@ -698,6 +706,17 @@ function reconnectState(players, now, used = 0, handled = 0) {
 }
 
 const REMATCH_LIMIT = 30000;
+
+function proposeRematchMap(current, side, requester, mapId) {
+  if (current?.agreed || current?.by === side || (!current && side !== requester)) return;
+  if (!Number.isInteger(mapId) || mapId < 0 || mapId > 4 || current?.mapId === mapId) return;
+  return { by: side, mapId, revision: (current?.revision ?? 0) + 1, agreed: false };
+}
+
+function acceptRematchMap(current, side, expectedRevision) {
+  if (!current || current.agreed || current.by === side || current.revision !== expectedRevision) return;
+  return { ...current, agreed: true };
+}
 
 function rematchStatus(votes, now) {
   const host = votes?.host;
@@ -1455,19 +1474,38 @@ function updateRematch() {
     if (session.rematchSelection !== round) {
       session.rematchSelection = round;
       get('rematchCharacter').value = String(Math.min(4, characters.indexOf(game.players[session.side].character)));
-      get('rematchMapLabel').hidden = session.side !== 0;
       get('rematchMap').value = String(game.mapId);
       get('ending').hidden = true;
       get('rematchSelection').hidden = false;
     }
+    const proposal = votes.mapProposal;
+    get('mapAgreement').hidden = Boolean(proposal?.agreed);
+    get('rematchCharacterPanel').hidden = !proposal?.agreed;
+    if (!proposal?.agreed) {
+      const side = sideName(session);
+      const requester = votes.host.acceptedAt <= votes.guest.acceptedAt ? 'host' : 'guest';
+      const canPropose = proposal ? proposal.by !== side : requester === side;
+      get('rematchSelection').querySelector('h2').textContent = '재대결 맵 합의';
+      get('mapProposalStatus').textContent = proposal
+        ? ('제안된 맵 · ' + maps[proposal.mapId].name + (canPropose ? '' : ' · 상대 응답 대기 중'))
+        : (canPropose ? '재대결에 사용할 맵을 제안해 주세요.' : '상대의 맵 제안을 기다리는 중이에요.');
+      get('rematchMapLabel').hidden = !canPropose;
+      get('proposeMap').hidden = !canPropose;
+      get('proposeMap').textContent = proposal ? '맵 변경 요청' : '맵 제안';
+      get('acceptMap').hidden = !proposal || !canPropose;
+      get('proposeMap').disabled = Boolean(session.mapBusy);
+      get('acceptMap').disabled = Boolean(session.mapBusy);
+      return;
+    }
+    get('rematchSelection').querySelector('h2').textContent = '재대결 캐릭터 선택';
     const chose = Number.isInteger(mine?.character);
     get('rematchReady').disabled = Boolean(session.rematchBusy || chose);
     get('rematchCharacter').disabled = Boolean(session.rematchBusy || chose);
-    get('rematchMap').disabled = Boolean(session.rematchBusy || chose);
-    get('rematchSelectionStatus').textContent = chose ? '상대가 캐릭터를 선택하는 중이에요.' : '';
+    get('rematchSelectionStatus').textContent = maps[proposal.mapId].name +
+      (chose ? ' · 상대 캐릭터 선택 대기 중' : '');
     if (order.phase === 'ready' && session.side === 0) {
       const next = new Arena(order.characters, Math.random, game.first === 0 ? 1 : 0,
-        votes.host.mapId ?? game.mapId);
+        proposal.mapId);
       next.seriesRound = round + 1;
       remoteKeys.clear();
       startArena(next);
@@ -1521,12 +1559,37 @@ get('rematchOffer').onclick = () => {
   }
 };
 get('rematchReady').onclick = () => {
-  if (room && rematchStatus(room.rematches[seriesRound()], Date.now() + room.timeOffset).phase === 'select') {
-    const choice = { character: selected('rematchCharacter') };
-    if (room.side === 0) choice.mapId = resolveMap(get('rematchMap').value);
-    void submitRematch(choice, true);
+  const votes = room?.rematches[seriesRound()];
+  if (votes?.mapProposal?.agreed && rematchStatus(votes, Date.now() + room.timeOffset).phase === 'select') {
+    void submitRematch({ character: selected('rematchCharacter') }, true);
   }
 };
+async function sendMapDecision(accept) {
+  const session = room;
+  const round = seriesRound();
+  const votes = session?.rematches[round];
+  if (!canOfferRematch(session) || session.mapBusy || !votes?.host?.acceptedAt || !votes?.guest?.acceptedAt) return;
+  const side = sideName(session);
+  const requester = votes.host.acceptedAt <= votes.guest.acceptedAt ? 'host' : 'guest';
+  const revision = votes.mapProposal?.revision ?? 0;
+  const mapId = resolveMap(get('rematchMap').value);
+  session.mapBusy = true;
+  try {
+    const { service, code } = session;
+    const target = service.ref(service.database, 'testRooms/' + code + '/rematches/' + round + '/mapProposal');
+    await service.runTransaction(target, current => {
+      if ((current?.revision ?? 0) !== revision) return;
+      return accept ? acceptRematchMap(current, side, revision) : proposeRematchMap(current, side, requester, mapId);
+    }, { applyLocally: false });
+  } catch (error) {
+    networkError(error);
+  } finally {
+    session.mapBusy = false;
+    if (room === session) updateRematch();
+  }
+}
+get('proposeMap').onclick = () => void sendMapDecision(false);
+get('acceptMap').onclick = () => void sendMapDecision(true);
 get('rematchCancel').onclick = () => get('replay').click();
 
 function watchGuest() {
