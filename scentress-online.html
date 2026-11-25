@@ -26,6 +26,11 @@
   font: inherit;
 }
 .room-list select { min-width: 0; max-width: 100%; }
+.stage[data-map="1"] { background: linear-gradient(150deg,#442a62,#9f5f9d 56%,#dfacd2); }
+.stage[data-map="2"] { background: linear-gradient(155deg,#273d45,#617b60 60%,#d3a975); }
+.stage[data-map="3"] { background: linear-gradient(150deg,#25294e,#445889 62%,#8387be); }
+.stage[data-map="4"] { background: linear-gradient(150deg,#342e66,#85628f 62%,#d9a889); }
+#mapName { display: block; margin-top: 2px; }
 .room-status { color: #ffdc9c; font-weight: 650; overflow-wrap: anywhere; }
 .room-status:empty { display: none; }
 .waiting-panel p,
@@ -114,7 +119,7 @@ body.game-rotated #roomCode { flex-basis: 8em; }
 <section class="stage setup-open" id="stage" aria-label="스핑크스 경기장">
   <canvas id="field" width="1170" height="540" tabindex="-1"></canvas>
   <div class="hud" id="hud" hidden>
-    <div class="status" id="p1"></div><div class="turn" id="turn"></div><div class="status right" id="p2"></div>
+    <div class="status" id="p1"></div><div class="turn"><span id="turn"></span><small id="mapName"></small></div><div class="status right" id="p2"></div>
     <div class="notice" id="notice" hidden></div>
     <div class="meters">
       <label>이동 <meter id="movement" min="0" max="1" value="1"></meter></label>
@@ -125,7 +130,7 @@ body.game-rotated #roomCode { flex-basis: 8em; }
   <div class="overlay" id="setup">
     <div class="panel" id="setupPanel">
       
-      <h2>스핑크스 · 2인 온라인 테스트</h2>
+      <h2>2인 온라인 대전</h2>
       <div class="choices"><label>플레이어 1<select id="left"></select></label><label>플레이어 2<select id="right"></select></label></div>
             <button class="primary" id="start">로컬 대전 시작</button>
       <small id="roomStatus" class="room-status" role="status"></small>
@@ -134,6 +139,7 @@ body.game-rotated #roomCode { flex-basis: 8em; }
         <select id="visibility" aria-label="방 공개 설정"><option value="public">공개방</option><option value="private">비공개방</option></select>
         <input class="room-code" id="roomPin" type="password" inputmode="numeric" maxlength="4" autocomplete="off" aria-label="비밀번호 4자리" placeholder="비밀번호 4자리" hidden>
       </div>
+      <label class="actions">방장 맵 선택 <select id="matchMap" aria-label="방장 맵 선택"></select></label>
       <div class="actions room-list">
         <select id="roomList" aria-label="대기 중인 방"><option value="">대기 중인 방 선택</option></select>
         <button id="loadRooms">방 목록 새로고침</button>
@@ -163,6 +169,7 @@ body.game-rotated #roomCode { flex-basis: 8em; }
       <h2>재대결 캐릭터 선택</h2>
       <label for="rematchCharacter">내 캐릭터</label>
       <select id="rematchCharacter"></select>
+      <label class="actions" id="rematchMapLabel" hidden>다음 맵 <select id="rematchMap" aria-label="다음 맵"></select></label>
       <p id="rematchSelectionStatus" role="status"></p>
       <div class="actions">
         <button class="primary" id="rematchReady" type="button">선택 완료</button>
@@ -253,39 +260,81 @@ function matchResult(left, right, turn) {
   return difference > 0 ? 'left' : 'right';
 }
 
+const ramps = x => 200 + Math.min(300, Math.max(0, (Math.abs(x - 1500) - 610) * 0.62));
+
+const maps = [
+  { name: 'RUNAWAY · 스핑크스', height: 1000, edge: [255, 201, 133], soil: [151, 91, 75],
+    bands: x => [[0, ramps(x)]] },
+  { name: 'SCENEDROME · Sky', height: 1000, edge: [255, 226, 250], soil: [146, 93, 165],
+    bands: x => {
+      const top = 355 + 82 * Math.sin(x / 435) + 61 * Math.cos(x / 225 + 1);
+      return [[top - 175, top]];
+    } },
+  { name: 'DEAREST · 통나무 다리', height: 1000, edge: [236, 209, 144], soil: [112, 84, 54],
+    bands: x => {
+      const top = 340 + 36 * Math.sin(x / 600);
+      return [[x < 620 || x > 2350 ? 0 : top - 82, top]];
+    } },
+  { name: 'PULSE · Valley', height: 1800, edge: [184, 250, 251], soil: [72, 104, 148],
+    bands: x => {
+      const lower = 385 + 95 * Math.sin((x - 1270) / 350) + x * 0.035;
+      const bands = x >= 300 && x <= 2700 ? [[lower - 70, lower]] : [];
+      if (x < 1210) {
+        const top = 1000 - 135 * Math.sin(x / 850);
+        bands.push([top - 105, top]);
+      }
+      if (x > 1770) {
+        const top = 1180 + 118 * Math.sin((x - 1770) / 720);
+        bands.push([top - 105, top]);
+      }
+      return bands;
+    } },
+  { name: 'GLOW UP · Heaven', height: 1000, edge: [255, 240, 193], soil: [140, 117, 161],
+    bands: x => {
+      const top = 205 + 415 * Math.sin(Math.PI * x / 3000);
+      return [[top - 150, top]];
+    } },
+];
+
+function resolveMap(value, random = Math.random) {
+  if (value === 'random') return Math.floor(random() * maps.length);
+  const id = Number(value);
+  return Number.isInteger(id) && maps[id] ? id : 0;
+}
+
 
 const WIDTH = 3000;
-const HEIGHT = 1000;
 const CELL = 5;
 const BODY = 50;
-const FLOOR = 200;
 const COLS = WIDTH / CELL;
-const ROWS = HEIGHT / CELL;
 const GRAVITY = 420;
 const MAX_SPEED = Math.sqrt(GRAVITY * WIDTH * 1.3);
 const DEG = Math.PI / 180;
 const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
 
-function initialHeight(x) {
-  return FLOOR + clamp((Math.abs(x - WIDTH / 2) - 610) * 0.62, 0, 300);
-}
-
 class Arena {
-  constructor(selection, random = Math.random, first = Math.floor(random() * 2)) {
+  constructor(selection, random = Math.random, first = Math.floor(random() * 2), mapId = 0) {
     this.random = random;
-    this.terrain = new Uint8Array(COLS * ROWS);
+    this.mapId = resolveMap(mapId, random);
+    this.map = maps[this.mapId];
+    this.height = this.map.height;
+    this.rows = this.height / CELL;
+    this.terrain = new Uint8Array(COLS * this.rows);
     for (let column = 0; column < COLS; column++) {
-      const height = Math.round(initialHeight((column + 0.5) * CELL) / CELL);
-      this.terrain.fill(1, column * ROWS, column * ROWS + height);
+      const base = column * this.rows;
+      for (const [bottom, top] of this.map.bands((column + 0.5) * CELL)) {
+        this.terrain.fill(1, base + Math.round(bottom / CELL), base + Math.round(top / CELL));
+      }
     }
     this.terrainVersion = 0;
     this.craters = [];
     const positions = [];
     for (let x = BODY / 2; x <= WIDTH - BODY / 2; x += CELL) {
-      const y = this.surface(x, HEIGHT, CELL);
-      if (y === null) continue;
-      const { slope, supported } = this.support({ slope: 0 }, x, y);
-      if (supported) positions.push({ x, y, slope });
+      for (const [, top] of this.map.bands(x + CELL / 2)) {
+        const y = Math.round(top / CELL) * CELL;
+        const { slope, supported } = this.support({ slope: 0 }, x, y);
+        if (supported) positions.push({ x, y, slope });
+      }
     }
     this.players = selection.map((id, index) => {
       const character = characters[id];
@@ -314,12 +363,12 @@ class Arena {
   }
 
   solid(x, y) {
-    if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT) return false;
-    return this.terrain[Math.floor(x / CELL) * ROWS + Math.floor(y / CELL)] === 1;
+    if (x < 0 || x >= WIDTH || y < 0 || y >= this.height) return false;
+    return this.terrain[Math.floor(x / CELL) * this.rows + Math.floor(y / CELL)] === 1;
   }
 
   surface(x, upper, lower) {
-    for (let y = Math.min(HEIGHT, Math.ceil(upper / CELL) * CELL); y >= Math.max(CELL, lower); y -= CELL) {
+    for (let y = Math.min(this.height, Math.ceil(upper / CELL) * CELL); y >= Math.max(CELL, lower); y -= CELL) {
       if (this.solid(x, y - 0.1) && !this.solid(x, y + 0.1)) return y;
     }
     return null;
@@ -450,7 +499,7 @@ class Arena {
     for (let sample = 1; sample <= samples; sample++) {
       shot.x = startX + dx * sample / samples;
       shot.y = startY + dy * sample / samples;
-      if (shot.age > FLIGHT_SECONDS || shot.x < 0 || shot.x >= WIDTH || shot.y < 0 || shot.y >= HEIGHT) {
+      if (shot.age > FLIGHT_SECONDS || shot.x < 0 || shot.x >= WIDTH || shot.y < 0 || shot.y >= this.height) {
         this.notice = 'OUT';
         this.shot = null;
         this.finishTurn();
@@ -491,9 +540,9 @@ class Arena {
 
   carve(x, y, radius) {
     for (let col = Math.max(0, Math.floor((x - radius) / CELL)); col <= Math.min(COLS - 1, Math.floor((x + radius) / CELL)); col++) {
-      for (let row = Math.max(0, Math.floor((y - radius) / CELL)); row <= Math.min(ROWS - 1, Math.floor((y + radius) / CELL)); row++) {
+      for (let row = Math.max(0, Math.floor((y - radius) / CELL)); row <= Math.min(this.rows - 1, Math.floor((y + radius) / CELL)); row++) {
         if (Math.hypot((col + 0.5) * CELL - x, (row + 0.5) * CELL - y) <= radius) {
-          this.terrain[col * ROWS + row] = 0;
+          this.terrain[col * this.rows + row] = 0;
         }
       }
     }
@@ -588,6 +637,7 @@ const frameFields = ['active', 'turn', 'phase', 'remaining', 'charge', 'charging
 
 function packArena(arena) {
   const frame = Object.fromEntries(frameFields.map(key => [key, arena[key] ?? null]));
+  frame.mapId = arena.mapId;
   frame.players = arena.players.map(({ character, ...player }) => ({
     ...player, characterId: characters.indexOf(character),
   }));
@@ -671,7 +721,6 @@ const field = get('field');
 const draw = field.getContext('2d');
 const mask = document.createElement('canvas');
 mask.width = WIDTH / CELL;
-mask.height = HEIGHT / CELL;
 const maskContext = mask.getContext('2d');
 const colors = ['#75c5ff', '#ff8d99'];
 const keys = new Set();
@@ -713,6 +762,10 @@ function startArena(arena) {
   keys.clear();
   follow = true;
   version = -1;
+  mask.height = arena.rows;
+  get('stage').dataset.map = String(arena.mapId);
+  get('stage').setAttribute('aria-label', arena.map.name + ' 경기장');
+  get('mapName').textContent = arena.map.name;
   get('stage').classList.remove('setup-open');
   get('setup').hidden = true;
   get('ending').hidden = true;
@@ -724,7 +777,7 @@ function startArena(arena) {
   field.focus();
 }
 get('start').onclick = () => startArena(new Arena([selected('left'), selected('right')], Math.random,
-  previousFirst === undefined ? undefined : 1 - previousFirst));
+  previousFirst === undefined ? undefined : 1 - previousFirst, resolveMap(get('matchMap')?.value)));
 
 function showSetupScreen() {
   game = undefined;
@@ -903,7 +956,8 @@ function updateMask() {
       if (!game.terrain[x * mask.height + y]) continue;
       const offset = (x + (mask.height - 1 - y) * mask.width) * 4;
       const edge = !game.terrain[x * mask.height + y + 1];
-      image.data.set(edge ? [255, 201, 133, 255] : [151 + y % 14, 91 + y % 12, 75, 255], offset);
+      const color = edge ? game.map.edge : game.map.soil;
+      image.data.set([color[0] + (edge ? 0 : y % 14), color[1], color[2], 255], offset);
     }
   }
   maskContext.putImageData(image, 0, 0);
@@ -919,7 +973,7 @@ function render() {
     cameraY = target.y - viewHeight * 0.43;
   }
   cameraX = clamp(cameraX, 0, WIDTH - viewWidth);
-  cameraY = clamp(cameraY, 0, HEIGHT - viewHeight);
+  cameraY = clamp(cameraY, 0, game.height - viewHeight);
   const positionX = x => (x - cameraX) * scale;
   const positionY = y => field.height - (y - cameraY) * scale;
   draw.clearRect(0, 0, field.width, field.height);
@@ -933,7 +987,7 @@ function render() {
     draw.fillRect(x - 20, 0, 40, field.height);
   }
   draw.imageSmoothingEnabled = false;
-  draw.drawImage(mask, positionX(0), positionY(HEIGHT), WIDTH * scale, HEIGHT * scale);
+  draw.drawImage(mask, positionX(0), positionY(game.height), WIDTH * scale, game.height * scale);
   draw.imageSmoothingEnabled = true;
   for (const index of [1 - game.active, game.active]) {
     const player = game.players[index];
@@ -980,15 +1034,15 @@ function render() {
     draw.fill();
   }
   if (mapVisible) {
-    const miniWidth = 292, miniHeight = miniWidth / 3, left = 12, top = 63;
+    const miniWidth = 292, miniHeight = miniWidth * game.height / WIDTH, left = 12, top = 63;
     const x = value => left + value * miniWidth / WIDTH;
-    const y = value => top + miniHeight - value * miniHeight / HEIGHT;
+    const y = value => top + miniHeight - value * miniHeight / game.height;
     draw.fillStyle = '#21142de8';
     draw.fillRect(left, top, miniWidth, miniHeight);
     draw.drawImage(mask, left, top, miniWidth, miniHeight);
     draw.strokeStyle = '#ffe388';
     draw.lineWidth = 2;
-    draw.strokeRect(x(cameraX), y(cameraY + viewHeight), viewWidth * miniWidth / WIDTH, viewHeight * miniHeight / HEIGHT);
+    draw.strokeRect(x(cameraX), y(cameraY + viewHeight), viewWidth * miniWidth / WIDTH, viewHeight * miniHeight / game.height);
     game.players.forEach((player, index) => {
       if (player.fell) return;
       draw.fillStyle = colors[index];
@@ -1277,7 +1331,7 @@ function renewLobbyListing(session) {
 function maybeStartHost() {
   if (room?.side !== 0 || game || !room.connected || room.restoring || room.leaving ||
       !room.presence?.guest?.online || room.guestCharacter === undefined) return;
-  startArena(new Arena([room.hostCharacter, room.guestCharacter]));
+  startArena(new Arena([room.hostCharacter, room.guestCharacter], Math.random, undefined, room.hostMap));
   game.seriesRound = 1;
   publishOnlineFrame(performance.now() + 100);
 }
@@ -1317,7 +1371,7 @@ function applyFrame(frame) {
   if (game && incomingRound < seriesRound()) return;
   if (game?.result && !frame.result && incomingRound === seriesRound()) return;
   if (!game || incomingRound > seriesRound()) {
-    startArena(new Arena(frame.players.map(player => player.characterId)));
+    startArena(new Arena(frame.players.map(player => player.characterId), Math.random, frame.first ?? undefined, frame.mapId));
     room.rematchSelection = null;
   }
   const previousTurn = game.turn;
@@ -1401,15 +1455,19 @@ function updateRematch() {
     if (session.rematchSelection !== round) {
       session.rematchSelection = round;
       get('rematchCharacter').value = String(Math.min(4, characters.indexOf(game.players[session.side].character)));
+      get('rematchMapLabel').hidden = session.side !== 0;
+      get('rematchMap').value = String(game.mapId);
       get('ending').hidden = true;
       get('rematchSelection').hidden = false;
     }
     const chose = Number.isInteger(mine?.character);
     get('rematchReady').disabled = Boolean(session.rematchBusy || chose);
     get('rematchCharacter').disabled = Boolean(session.rematchBusy || chose);
+    get('rematchMap').disabled = Boolean(session.rematchBusy || chose);
     get('rematchSelectionStatus').textContent = chose ? '상대가 캐릭터를 선택하는 중이에요.' : '';
     if (order.phase === 'ready' && session.side === 0) {
-      const next = new Arena(order.characters, Math.random, game.first === 0 ? 1 : 0);
+      const next = new Arena(order.characters, Math.random, game.first === 0 ? 1 : 0,
+        votes.host.mapId ?? game.mapId);
       next.seriesRound = round + 1;
       remoteKeys.clear();
       startArena(next);
@@ -1450,6 +1508,10 @@ for (let index = 0; index < 5; index++) {
   get('rematchCharacter').add(new Option(characters[index].name, index));
 }
 get('rematchCharacter').add(new Option('랜덤', 'random'));
+for (const id of ['matchMap', 'rematchMap']) {
+  maps.forEach((map, index) => get(id).add(new Option(map.name, index)));
+  get(id).add(new Option('랜덤 맵', 'random'));
+}
 get('rematchOffer').onclick = () => {
   if (!room) return;
   const votes = room.rematches[seriesRound()];
@@ -1460,7 +1522,9 @@ get('rematchOffer').onclick = () => {
 };
 get('rematchReady').onclick = () => {
   if (room && rematchStatus(room.rematches[seriesRound()], Date.now() + room.timeOffset).phase === 'select') {
-    void submitRematch({ character: selected('rematchCharacter') }, true);
+    const choice = { character: selected('rematchCharacter') };
+    if (room.side === 0) choice.mapId = resolveMap(get('rematchMap').value);
+    void submitRematch(choice, true);
   }
 };
 get('rematchCancel').onclick = () => get('replay').click();
@@ -1534,11 +1598,13 @@ async function createRoom() {
     value => value.toString(16).padStart(2, '0')).join('');
   const path = openRoom(service, code, 0);
   const character = selected('left');
+  const mapId = resolveMap(get('matchMap').value);
+  room.hostMap = mapId;
   const expires = Date.now() + 7200000;
   const entries = {
-    ['testRooms/' + code + '/host']: { uid: service.uid, character, expires, private: privateRoom },
+    ['testRooms/' + code + '/host']: { uid: service.uid, character, mapId, expires, private: privateRoom },
     ['lobbyRooms/' + code]: {
-      title: '스핑크스 대전 · ' + characters[character].name, private: privateRoom, expires,
+      title: maps[mapId].name + ' 대전', private: privateRoom, expires,
       owner: service.uid, lastSeen: service.serverTimestamp(),
     },
   };
@@ -1597,6 +1663,7 @@ async function restoreRoom() {
     }
     showWaitingRoom(membership.val().character, saved.side, Boolean(host.val().private));
     if (saved.side === 0) {
+      room.hostMap = resolveMap(host.val().mapId);
       const [guest, closed] = await Promise.all([service.get(path('guest')), service.get(path('closed'))]);
       if (closed.val()) throw Error('The saved room is closed');
       if (guest.exists()) {
