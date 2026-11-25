@@ -32,6 +32,13 @@
 .stage[data-map="4"] { background: linear-gradient(150deg,#342e66,#85628f 62%,#d9a889); }
 #mapName { display: block; margin-top: 2px; }
 #mapAgreement, #rematchCharacterPanel { display: grid; gap: 7px; }
+#mapChangeAlert {
+  padding: 6px 9px;
+  border: 1px solid #ffdc9c;
+  border-radius: 8px;
+  color: #ffdc9c;
+  font-weight: 650;
+}
 .room-status { color: #ffdc9c; font-weight: 650; overflow-wrap: anywhere; }
 .room-status:empty { display: none; }
 .waiting-panel p,
@@ -169,6 +176,7 @@ body.game-rotated #roomCode { flex-basis: 8em; }
     <div class="panel">
       <h2>재대결 캐릭터 선택</h2>
       <div id="mapAgreement" hidden>
+        <p id="mapChangeAlert" role="alert" hidden></p>
         <p id="mapProposalStatus" role="status"></p>
         <label class="actions" id="rematchMapLabel">다음 맵 <select id="rematchMap" aria-label="다음 맵"></select></label>
         <div class="actions">
@@ -706,6 +714,10 @@ function reconnectState(players, now, used = 0, handled = 0) {
 }
 
 const REMATCH_LIMIT = 30000;
+
+function hasIncomingMapChange(proposal, player) {
+  return Boolean(proposal && !proposal.agreed && proposal.revision > 1 && proposal.by !== player);
+}
 
 function proposeRematchMap(current, side, requester, mapId) {
   if (current?.agreed || current?.by === side || (!current && side !== requester)) return;
@@ -1485,6 +1497,11 @@ function updateRematch() {
       const side = sideName(session);
       const requester = votes.host.acceptedAt <= votes.guest.acceptedAt ? 'host' : 'guest';
       const canPropose = proposal ? proposal.by !== side : requester === side;
+      const alert = get('mapChangeAlert');
+      const incomingChange = hasIncomingMapChange(proposal, side);
+      const alertText = incomingChange ? '상대가 맵 변경을 요청했습니다.' : '';
+      alert.hidden = !incomingChange;
+      if (alert.textContent !== alertText) alert.textContent = alertText;
       get('rematchSelection').querySelector('h2').textContent = '재대결 맵 합의';
       get('mapProposalStatus').textContent = proposal
         ? ('제안된 맵 · ' + maps[proposal.mapId].name + (canPropose ? '' : ' · 상대 응답 대기 중'))
